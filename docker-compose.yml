@@ -1,0 +1,24 @@
+﻿services:
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - contexa_postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init/01-enable-vector.sql:/docker-entrypoint-initdb.d/01-enable-vector.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  contexa_postgres_data:
