@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     app_name: str = "Contexa API"
     environment: str = "development"
     database_url: str
+    deepgram_api_key: str | None = None
+    deepgram_model: str = "nova-3"
+    deepgram_language: str = "en-US"
 
     cors_origins: list[str] = Field(
         default_factory=lambda: [
