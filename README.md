@@ -1,4 +1,3 @@
-@'
 # Contexa
 
 A real-time AI copilot that builds structured meeting memory to help
