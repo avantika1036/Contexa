@@ -8,3 +8,4 @@ python-dotenv>=1.0,<2.0
 httpx>=0.28,<1.0
 pytest>=8.3,<10.0
 websockets>=14,<17
+openai>=2.6,<3.0

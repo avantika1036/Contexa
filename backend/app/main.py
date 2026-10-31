@@ -1,20 +1,28 @@
 import asyncio
 import json
 import logging
+import time
 from urllib.parse import urlencode
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import delete, func, inspect as sqlalchemy_inspect, select, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
 from app.database import engine, get_db, get_session_factory
-from app.models import Meeting, TranscriptSegment
-from app.schemas import MeetingCreate, MeetingRead, TranscriptSegmentRead
+from app.models import Meeting, MemoryItem, TranscriptSegment
+from app.schemas import (
+    MeetingCreate, MeetingRead, MemoryExtractionResponse, MemoryItemRead, TranscriptSegmentRead,
+    MeetingQuestionRequest, MeetingQuestionResponse, AutoMeetingCreate, AutoMeetingResponse,
+)
+from app.memory_service import process_meeting_transcript_memory
+from app.qa_service import answer_meeting_question as generate_meeting_answer
 from starlette.websockets import WebSocketState
+from app.speaker_segments import split_words_by_speaker
+from app.transcription_params import keyterm_params, language_warning
 from websockets.asyncio.client import ClientConnection, connect as upstream_connect
 from websockets.exceptions import ConnectionClosed
 
@@ -22,10 +30,100 @@ from websockets.exceptions import ConnectionClosed
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 MAX_AUDIO_CHUNK_BYTES = 2_000_000
+MEMORY_EXTRACTION_JOBS: dict[str, dict[str, object]] = {}
+# Number of live WebSocket connections per meeting; cleanup never touches a connected meeting.
+ACTIVE_MEETING_CONNECTIONS: dict[str, int] = {}
+
+
+class AudioTimeline:
+    """Map compressed raw-audio stream time back to elapsed meeting time after VAD gaps."""
+
+    def __init__(self) -> None:
+        # Seconds already elapsed in the meeting before this audio stream began. Non-zero
+        # when capture resumes in an existing session, so timestamps never restart at 0.
+        self.base_offset = 0.0
+        self.reset(False, 48000, 1)
+
+    def reset(self, raw_pcm: bool, sample_rate: int = 48000, channels: int = 1) -> None:
+        self.raw_pcm = raw_pcm
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.started_at = time.monotonic()
+        self.last_chunk_at: float | None = None
+        self.last_chunk_duration = 0.0
+        self.stream_seconds = 0.0
+        # Each tuple is (compressed stream second at which the gap begins, omitted wall seconds).
+        self.gaps: list[tuple[float, float]] = []
+
+    def record_chunk(self, byte_length: int) -> None:
+        if not self.raw_pcm or byte_length <= 0:
+            return
+        now = time.monotonic()
+        duration = byte_length / (2 * self.channels * self.sample_rate)
+        if self.last_chunk_at is None:
+            initial_wait = max(0.0, now - self.started_at)
+            if initial_wait > 0.12:
+                self.gaps.append((0.0, initial_wait))
+        else:
+            elapsed = max(0.0, now - self.last_chunk_at)
+            omitted = elapsed - self.last_chunk_duration
+            # Ignore ordinary scheduling jitter; VAD pauses are generally far longer.
+            if omitted > 0.20:
+                self.gaps.append((self.stream_seconds, omitted))
+        self.last_chunk_at = now
+        self.last_chunk_duration = duration
+        self.stream_seconds += duration
+
+    def map_time(self, stream_seconds: float) -> float:
+        if not self.raw_pcm:
+            return max(0.0, stream_seconds) + self.base_offset
+        offset = sum(gap for stream_anchor, gap in self.gaps if stream_anchor <= stream_seconds)
+        return max(0.0, stream_seconds + offset) + self.base_offset
+
+
+async def _keep_deepgram_alive(
+    connection: ClientConnection,
+    send_lock: asyncio.Lock,
+    meeting_id: str,
+) -> None:
+    """Keep a live transcription WebSocket open while VAD suppresses silent audio frames."""
+    while True:
+        await asyncio.sleep(5.0)
+        try:
+            async with send_lock:
+                await connection.send(json.dumps({"type": "KeepAlive"}))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Deepgram keepalive stopped for meeting %s", meeting_id, exc_info=True)
+            return
+
+
+def _memory_schema_ready(bind=engine) -> bool:
+    """Check that the table and all columns expected by the current ORM model exist."""
+    try:
+        inspector = sqlalchemy_inspect(bind)
+        if not inspector.has_table("memory_items"):
+            return False
+        actual_columns = {column["name"] for column in inspector.get_columns("memory_items")}
+        expected_columns = {column.name for column in MemoryItem.__table__.columns}
+        return expected_columns.issubset(actual_columns)
+    except SQLAlchemyError:
+        logger.exception("Could not inspect the structured-memory database schema")
+        return False
+
+
+def _memory_migration_message() -> str:
+    return (
+        "The structured-memory database schema is missing or outdated (the memory_items "
+        "table or one of its columns, such as decision_state, is unavailable). From "
+        "C:/Work/Contexa/backend run `python -m alembic upgrade head`, then restart FastAPI. "
+        "Existing meetings and transcripts are preserved; do not reset the database volume."
+    )
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.2.0",
+    version="0.3.0",
     description="Real-time meeting context and memory API.",
 )
 
@@ -55,12 +153,191 @@ def database_health_check() -> dict[str, str]:
     return {"status": "ok", "database": "connected"}
 
 
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _segment_count(db: Session, meeting_id: str) -> int:
+    return int(db.scalar(select(func.count()).select_from(TranscriptSegment).where(TranscriptSegment.meeting_id == meeting_id)) or 0)
+
+
+def _resume_offset_seconds(session_factory: sessionmaker[Session], meeting_id: str) -> float:
+    """Elapsed meeting time when a new audio stream starts in a session that already has transcript."""
+    with session_factory() as session:
+        meeting = session.get(Meeting, meeting_id)
+        if meeting is None or _segment_count(session, meeting_id) == 0:
+            return 0.0
+        last_end = float(session.scalar(select(func.max(TranscriptSegment.end_seconds)).where(TranscriptSegment.meeting_id == meeting_id)) or 0.0)
+        elapsed = (datetime.now(timezone.utc) - _aware(meeting.created_at)).total_seconds()
+        return max(0.0, last_end, elapsed)
+
+
+def _delete_meeting_records(db: Session, meeting_id: str) -> None:
+    """Delete a meeting and its dependent rows explicitly (does not rely on FK cascade support)."""
+    db.execute(delete(MemoryItem).where(MemoryItem.meeting_id == meeting_id))
+    db.execute(delete(TranscriptSegment).where(TranscriptSegment.meeting_id == meeting_id))
+    db.execute(delete(Meeting).where(Meeting.id == meeting_id))
+    db.commit()
+    MEMORY_EXTRACTION_JOBS.pop(meeting_id, None)
+
+
+def _finish_active_meeting(
+    meeting: Meeting,
+    db: Session,
+    background_tasks: BackgroundTasks,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Mark an open meeting ended and queue the one end-of-meeting memory extraction."""
+    meeting.status = "ended"
+    meeting.ended_at = datetime.now(timezone.utc)
+    meeting.suspended_at = None
+    db.commit()
+    db.refresh(meeting)
+    # BackgroundTasks starts only after the ended state is committed. No Groq calls happen
+    # while the meeting is live; one short meeting is usually one provider request.
+    if settings.memory_auto_extract_on_end:
+        MEMORY_EXTRACTION_JOBS[meeting.id] = {
+            "meeting_id": meeting.id, "status": "queued", "item_count": 0,
+            "message": "Meeting ended. Structured memory extraction is queued.",
+        }
+        background_tasks.add_task(_extract_memory_after_meeting_end, meeting.id, session_factory)
+
+
 @app.post("/api/meetings", response_model=MeetingRead, status_code=201, tags=["meetings"])
 def create_meeting(payload: MeetingCreate, db: Session = Depends(get_db)) -> Meeting:
     meeting = Meeting(title=payload.title)
     db.add(meeting)
     db.commit()
     db.refresh(meeting)
+    return meeting
+
+
+@app.post(
+    "/api/meetings/auto",
+    response_model=AutoMeetingResponse,
+    status_code=200,
+    tags=["meetings"],
+)
+def create_or_reuse_auto_meeting(
+    payload: AutoMeetingCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    session_factory: sessionmaker[Session] = Depends(get_session_factory),
+) -> dict[str, object]:
+    """Return the active or recently suspended session for a stable provider meeting ID.
+
+    A suspended session is reusable only within the configured grace period. Expired
+    suspended sessions are finalized (or discarded if empty) before a fresh row is made.
+    Ended sessions are never resumed.
+    """
+    existing = db.scalar(
+        select(Meeting).where(
+            Meeting.capture_key == payload.capture_key,
+            Meeting.status.in_(["active", "suspended"]),
+        )
+    )
+    if existing is not None:
+        if existing.status == "suspended":
+            suspended_at = _aware(existing.suspended_at or existing.created_at)
+            age_seconds = max(0.0, (datetime.now(timezone.utc) - suspended_at).total_seconds())
+            if age_seconds > max(0, settings.suspended_session_resume_grace_seconds):
+                if _segment_count(db, existing.id) == 0:
+                    expired_id = existing.id
+                    _delete_meeting_records(db, expired_id)
+                    logger.info("Discarded expired empty suspended session %s", expired_id)
+                else:
+                    _finish_active_meeting(existing, db, background_tasks, session_factory)
+                    logger.info("Finalized expired suspended session %s after %.1fs", existing.id, age_seconds)
+                existing = None
+            else:
+                existing.status = "active"
+                existing.suspended_at = None
+                existing.ended_at = None
+                if payload.title:
+                    existing.title = payload.title[:200]
+                if payload.process_name:
+                    existing.capture_process_name = payload.process_name[:100]
+                db.commit()
+                db.refresh(existing)
+                logger.info("Resumed suspended session %s for capture key %s", existing.id, payload.capture_key)
+                return {"meeting": existing, "reused": True}
+        else:
+            if payload.process_name:
+                existing.capture_process_name = payload.process_name[:100]
+            db.commit()
+            db.refresh(existing)
+            return {"meeting": existing, "reused": True}
+
+    meeting = Meeting(
+        title=payload.title,
+        status="active",
+        audio_source="desktop_auto",
+        capture_key=payload.capture_key,
+        capture_process_name=(payload.process_name or None),
+    )
+    db.add(meeting)
+    try:
+        db.commit()
+        db.refresh(meeting)
+        return {"meeting": meeting, "reused": False}
+    except IntegrityError:
+        # Two detector events can race. The partial unique index is the source of truth:
+        # after rolling back, load the row inserted by the competing request.
+        db.rollback()
+        existing = db.scalar(
+            select(Meeting).where(
+                Meeting.capture_key == payload.capture_key,
+                Meeting.status.in_(["active", "suspended"]),
+            )
+        )
+        if existing is None:
+            raise HTTPException(status_code=409, detail="Could not claim this meeting identity. Retry detection.")
+        if existing.status == "suspended":
+            existing.status = "active"
+            existing.suspended_at = None
+            existing.ended_at = None
+            db.commit()
+            db.refresh(existing)
+        return {"meeting": existing, "reused": True}
+
+
+@app.post("/api/meetings/{meeting_id}/suspend", response_model=MeetingRead, tags=["meetings"])
+def suspend_meeting(meeting_id: str, db: Session = Depends(get_db)) -> Meeting:
+    """Persist a recoverable capture interruption without declaring the meeting ended."""
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None:
+        raise HTTPException(status_code=404, detail="Meeting session not found.")
+    if meeting.status == "ended":
+        raise HTTPException(status_code=409, detail="This meeting session has ended and cannot be suspended.")
+    if meeting.status == "active":
+        if ACTIVE_MEETING_CONNECTIONS.get(meeting_id, 0) > 0:
+            raise HTTPException(status_code=409, detail="Stop the active capture stream before suspending this meeting.")
+        meeting.status = "suspended"
+        meeting.suspended_at = datetime.now(timezone.utc)
+        meeting.ended_at = None
+        db.commit()
+        db.refresh(meeting)
+    return meeting
+
+
+@app.post("/api/meetings/{meeting_id}/resume", response_model=MeetingRead, tags=["meetings"])
+def resume_meeting(meeting_id: str, db: Session = Depends(get_db)) -> Meeting:
+    """Resume a suspended session; never revive a permanently ended session."""
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None:
+        raise HTTPException(status_code=404, detail="Meeting session not found.")
+    if meeting.status == "ended":
+        raise HTTPException(status_code=409, detail="This meeting session has ended and cannot be resumed.")
+    if meeting.status == "suspended":
+        suspended_at = _aware(meeting.suspended_at or meeting.created_at)
+        age_seconds = max(0.0, (datetime.now(timezone.utc) - suspended_at).total_seconds())
+        if age_seconds > max(0, settings.suspended_session_resume_grace_seconds):
+            raise HTTPException(status_code=409, detail="The meeting resume window has expired. Create a fresh session.")
+        meeting.status = "active"
+        meeting.suspended_at = None
+        meeting.ended_at = None
+        db.commit()
+        db.refresh(meeting)
     return meeting
 
 
@@ -81,23 +358,152 @@ def get_meeting(meeting_id: str, db: Session = Depends(get_db)) -> Meeting:
     return meeting
 
 
+async def _extract_memory_after_meeting_end(
+    meeting_id: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Run one batched extraction after capture stops and the transcript is flushed."""
+    job: dict[str, object] = {"meeting_id": meeting_id, "status": "processing", "message": "Extracting structured memory from the completed transcript."}
+    MEMORY_EXTRACTION_JOBS[meeting_id] = job
+
+    if not settings.memory_auto_extract_on_end:
+        MEMORY_EXTRACTION_JOBS[meeting_id] = {
+            "meeting_id": meeting_id, "status": "skipped", "item_count": 0,
+            "message": "Automatic extraction is disabled. Use the Memory panel's extract action if needed.",
+        }
+        return
+    api_key = settings.memory_api_key
+    if not api_key:
+        MEMORY_EXTRACTION_JOBS[meeting_id] = {
+            "meeting_id": meeting_id, "status": "failed", "item_count": 0,
+            "message": "Add GROQ_API_KEY to the repository-root .env file and restart FastAPI.",
+        }
+        logger.warning("Skipping end-of-meeting memory extraction for %s: Groq API key is not configured", meeting_id)
+        return
+    if not _memory_schema_ready():
+        MEMORY_EXTRACTION_JOBS[meeting_id] = {
+            "meeting_id": meeting_id, "status": "failed", "item_count": 0,
+            "message": _memory_migration_message(),
+        }
+        logger.error("Skipping end-of-meeting memory extraction for %s: %s", meeting_id, _memory_migration_message())
+        return
+
+    try:
+        result = await process_meeting_transcript_memory(
+            session_factory,
+            meeting_id,
+            api_key=api_key,
+            model=settings.memory_model,
+            base_url=settings.memory_base_url,
+        )
+        items = result.get("items", [])
+        processed_segments = int(result.get("processed_segments", 0))
+        message = (
+            f"Memory extraction complete: {len(items)} item(s) from {processed_segments} transcript segment(s)."
+            if processed_segments else "No transcript segments were saved for this meeting, so no Groq request was made."
+        )
+        MEMORY_EXTRACTION_JOBS[meeting_id] = {
+            "meeting_id": meeting_id,
+            "status": "succeeded" if processed_segments else "skipped",
+            "processed_segments": processed_segments,
+            "item_count": len(items),
+            "message": message,
+        }
+        logger.info(
+            "End-of-meeting memory extraction finished: meeting_id=%s processed_segments=%s saved_items=%s",
+            meeting_id, processed_segments, len(items),
+        )
+    except Exception:
+        logger.exception("End-of-meeting memory extraction failed for %s", meeting_id)
+        MEMORY_EXTRACTION_JOBS[meeting_id] = {
+            "meeting_id": meeting_id, "status": "failed", "item_count": 0,
+            "message": "Automatic memory extraction failed. Check the Groq API key, model, account limits, database schema, and backend log.",
+        }
+
+
 @app.post(
     "/api/meetings/{meeting_id}/end",
     response_model=MeetingRead,
     tags=["meetings"],
 )
-def end_meeting(meeting_id: str, db: Session = Depends(get_db)) -> Meeting:
+def end_meeting(
+    meeting_id: str,
+    background_tasks: BackgroundTasks,
+    discard_if_empty: bool = Query(
+        default=False,
+        description="Delete the session instead of ending it when it has no transcript (auto-capture uses this).",
+    ),
+    db: Session = Depends(get_db),
+    session_factory: sessionmaker[Session] = Depends(get_session_factory),
+) -> Meeting | MeetingRead:
     meeting = db.get(Meeting, meeting_id)
     if meeting is None:
         raise HTTPException(status_code=404, detail="Meeting session not found.")
 
-    if meeting.status == "active":
-        meeting.status = "ended"
-        meeting.ended_at = datetime.now(timezone.utc)
-        db.commit()
-        db.refresh(meeting)
+    if meeting.status in {"active", "suspended"}:
+        if discard_if_empty and _segment_count(db, meeting_id) == 0:
+            snapshot = MeetingRead.model_validate(meeting).model_copy(
+                update={"status": "discarded", "ended_at": datetime.now(timezone.utc)}
+            )
+            _delete_meeting_records(db, meeting_id)
+            logger.info("Discarded empty meeting session %s", meeting_id)
+            return snapshot
+        _finish_active_meeting(meeting, db, background_tasks, session_factory)
 
     return meeting
+
+
+@app.delete("/api/meetings/{meeting_id}", status_code=204, tags=["meetings"])
+def delete_meeting(meeting_id: str, db: Session = Depends(get_db)) -> None:
+    """Permanently delete a meeting, its transcript and its structured memory."""
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None:
+        raise HTTPException(status_code=404, detail="Meeting session not found.")
+    if ACTIVE_MEETING_CONNECTIONS.get(meeting_id, 0) > 0:
+        raise HTTPException(status_code=409, detail="This meeting is currently being captured. Stop capture first.")
+    _delete_meeting_records(db, meeting_id)
+
+
+@app.post("/api/meetings/cleanup", tags=["meetings"])
+def cleanup_meetings(
+    background_tasks: BackgroundTasks,
+    purge_empty: bool = Query(default=False, description="Also delete ended sessions that have no transcript."),
+    idle_minutes: int | None = Query(default=None, ge=1, le=1440),
+    db: Session = Depends(get_db),
+    session_factory: sessionmaker[Session] = Depends(get_session_factory),
+) -> dict[str, int]:
+    """Close abandoned sessions and optionally remove empty duplicates left by earlier versions."""
+    threshold_minutes = idle_minutes or settings.stale_active_meeting_minutes
+    now = datetime.now(timezone.utc)
+    counts = {"ended": 0, "discarded": 0, "purged": 0}
+
+    for meeting in list(db.scalars(select(Meeting).where(Meeting.status.in_(["active", "suspended"]))).all()):
+        if ACTIVE_MEETING_CONNECTIONS.get(meeting.id, 0) > 0:
+            continue
+        latest_segment = db.scalar(
+            select(func.max(TranscriptSegment.created_at)).where(TranscriptSegment.meeting_id == meeting.id)
+        )
+        if meeting.status == "suspended" and meeting.suspended_at is not None:
+            last_activity = _aware(meeting.suspended_at)
+            if latest_segment is not None:
+                last_activity = max(last_activity, _aware(latest_segment))
+        else:
+            last_activity = _aware(latest_segment or meeting.created_at)
+        if (now - last_activity).total_seconds() < threshold_minutes * 60:
+            continue
+        if _segment_count(db, meeting.id) == 0:
+            _delete_meeting_records(db, meeting.id)
+            counts["discarded"] += 1
+        else:
+            _finish_active_meeting(meeting, db, background_tasks, session_factory)
+            counts["ended"] += 1
+
+    if purge_empty:
+        for meeting in list(db.scalars(select(Meeting).where(Meeting.status.in_(["ended", "discarded"]))).all()):
+            if _segment_count(db, meeting.id) == 0:
+                _delete_meeting_records(db, meeting.id)
+                counts["purged"] += 1
+    return counts
 
 
 @app.get("/api/transcription/status", tags=["transcription"])
@@ -107,6 +513,8 @@ def transcription_status() -> dict[str, object]:
         "configured": bool(settings.deepgram_api_key and settings.deepgram_api_key.strip()),
         "model": settings.deepgram_model,
         "language": settings.deepgram_language,
+        "language_hints": settings.language_hints,
+        "multilingual": settings.deepgram_language.strip().lower() == "multi",
     }
 
 
@@ -130,6 +538,221 @@ def list_transcript_segments(
     return list(db.scalars(statement).all())
 
 
+@app.get("/api/memory/status", tags=["memory"])
+def memory_status() -> dict[str, object]:
+    provider_configured = bool(settings.memory_api_key)
+    schema_ready = _memory_schema_ready()
+    configured = provider_configured and schema_ready
+    if not provider_configured:
+        message = "Add GROQ_API_KEY to the repository-root .env file and restart FastAPI."
+    elif not schema_ready:
+        message = _memory_migration_message()
+    elif not settings.memory_auto_extract_on_end:
+        message = (
+            "Structured memory is configured in manual mode. No Groq requests are made during live capture. "
+            "Use 'Extract saved transcript' only when you explicitly need an early extraction."
+        )
+    else:
+        message = (
+            "Structured memory is ready. Extraction runs automatically after the meeting ends; "
+            "no Groq requests are made while the meeting is live. Short meetings usually need one request."
+        )
+    return {
+        "provider": settings.memory_provider,
+        "configured": configured,
+        "provider_configured": provider_configured,
+        "schema_ready": schema_ready,
+        "model": settings.memory_model,
+        "base_url": settings.memory_base_url,
+        "automatic_extraction": bool(configured and settings.memory_auto_extract_on_end),
+        "extraction_timing": "meeting_end" if settings.memory_auto_extract_on_end else "manual",
+        "message": message,
+    }
+
+
+@app.post(
+    "/api/meetings/{meeting_id}/ask",
+    response_model=MeetingQuestionResponse,
+    tags=["meeting Q&A"],
+)
+async def ask_meeting_question(
+    meeting_id: str,
+    request: MeetingQuestionRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Answer explicit user questions from a selected meeting, optionally adding general context."""
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None:
+        raise HTTPException(status_code=404, detail="Meeting session not found.")
+    if not settings.memory_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Meeting Q&A is not configured. Add GROQ_API_KEY to the repository-root .env file and restart Contexa.",
+        )
+
+    transcript_statement = (
+        select(TranscriptSegment)
+        .where(TranscriptSegment.meeting_id == meeting_id)
+        .order_by(TranscriptSegment.start_seconds, TranscriptSegment.created_at)
+    )
+    transcript_rows = list(db.scalars(transcript_statement).all())
+    memory_statement = (
+        select(MemoryItem)
+        .where(MemoryItem.meeting_id == meeting_id)
+        .order_by(MemoryItem.start_seconds, MemoryItem.created_at)
+    )
+    memory_rows: list[MemoryItem] = []
+    if _memory_schema_ready(db.get_bind()):
+        memory_rows = list(db.scalars(memory_statement).all())
+
+    transcript_context = [
+        {
+            "id": segment.id,
+            "start_seconds": segment.start_seconds,
+            "end_seconds": segment.end_seconds,
+            "speaker_id": segment.speaker_id,
+            "audio_channel": segment.audio_channel,
+            "text": segment.text,
+        }
+        for segment in transcript_rows
+    ]
+    memory_context = [
+        {
+            "id": item.id, "item_type": item.item_type, "title": item.title,
+            "content": item.content, "status": item.status,
+            "decision_state": item.decision_state, "owner": item.owner,
+            "evidence_quote": item.evidence_quote,
+            "source_segment_ids": item.source_segment_ids,
+            "start_seconds": item.start_seconds, "end_seconds": item.end_seconds,
+        }
+        for item in memory_rows
+    ]
+    turns = [turn.model_dump() for turn in request.history[-6:]]
+    # Release the request DB connection during the provider call. No provider request is
+    # made while typing; this route runs only when the user submits an explicit question.
+    db.close()
+    try:
+        answer = await generate_meeting_answer(
+            question=request.question,
+            scope=request.scope,
+            transcript_segments=transcript_context,
+            memory_items=memory_context,
+            history=turns,
+            api_key=settings.memory_api_key,
+            model=settings.memory_model,
+            base_url=settings.memory_base_url,
+        )
+    except Exception as exc:
+        logger.exception("Meeting Q&A request failed for meeting %s", meeting_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Contexa could not generate an answer. Check the Groq model, account limits, and backend log.",
+        ) from exc
+
+    return {"meeting_id": meeting_id, **answer}
+
+
+@app.get("/api/meetings/{meeting_id}/memory/status", tags=["memory"])
+def meeting_memory_extraction_status(
+    meeting_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None:
+        raise HTTPException(status_code=404, detail="Meeting session not found.")
+    existing = MEMORY_EXTRACTION_JOBS.get(meeting_id)
+    if existing is not None:
+        return dict(existing)
+    return {
+        "meeting_id": meeting_id,
+        "status": "not_started",
+        "item_count": 0,
+        "automatic_extraction": bool(settings.memory_auto_extract_on_end),
+        "message": (
+            "Memory extraction will start automatically when the meeting ends."
+            if meeting.status == "active" and settings.memory_auto_extract_on_end
+            else "No automatic memory extraction job has run for this meeting yet."
+        ),
+    }
+
+
+@app.get(
+    "/api/meetings/{meeting_id}/memory",
+    response_model=list[MemoryItemRead],
+    tags=["memory"],
+)
+def list_meeting_memory(
+    meeting_id: str,
+    item_type: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> list[MemoryItem]:
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None:
+        raise HTTPException(status_code=404, detail="Meeting session not found.")
+    if not _memory_schema_ready(db.get_bind()):
+        raise HTTPException(status_code=503, detail=_memory_migration_message())
+
+    valid_types = {
+        "topic", "fact", "entity", "proposal", "argument", "question",
+        "open_question", "decision", "action_item", "event", "person",
+    }
+    if item_type is not None and item_type not in valid_types:
+        raise HTTPException(status_code=422, detail="Unsupported memory item type.")
+
+    statement = select(MemoryItem).where(MemoryItem.meeting_id == meeting_id)
+    if item_type is not None:
+        statement = statement.where(MemoryItem.item_type == item_type)
+    statement = statement.order_by(MemoryItem.start_seconds, MemoryItem.item_type, MemoryItem.created_at)
+    return list(db.scalars(statement).all())
+
+
+@app.post(
+    "/api/meetings/{meeting_id}/memory/extract",
+    response_model=MemoryExtractionResponse,
+    tags=["memory"],
+)
+async def extract_meeting_memory(
+    meeting_id: str,
+    db: Session = Depends(get_db),
+    session_factory: sessionmaker[Session] = Depends(get_session_factory),
+) -> dict[str, object]:
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None:
+        raise HTTPException(status_code=404, detail="Meeting session not found.")
+    if not _memory_schema_ready(db.get_bind()):
+        raise HTTPException(status_code=503, detail=_memory_migration_message())
+    # Do not hold the request's database connection open while the LLM provider runs.
+    db.close()
+    api_key = settings.memory_api_key
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Structured memory extraction is not configured. Add GROQ_API_KEY to the repository-root .env file and restart FastAPI.",
+        )
+
+    try:
+        result = await process_meeting_transcript_memory(
+            session_factory,
+            meeting_id,
+            api_key=api_key,
+            model=settings.memory_model,
+            base_url=settings.memory_base_url,
+        )
+    except Exception as exc:
+        logger.exception("Manual memory extraction failed for meeting %s", meeting_id)
+        raise HTTPException(
+            status_code=502,
+            detail="The structured-memory provider failed. Check the server log and API configuration.",
+        ) from exc
+
+    return {
+        "meeting_id": meeting_id,
+        "processed_segments": int(result["processed_segments"]),
+        "item_count": len(result["items"]),
+        "items": result["items"],
+    }
+
+
 def _persist_final_segment(
     session_factory: sessionmaker[Session],
     meeting_id: str,
@@ -138,6 +761,7 @@ def _persist_final_segment(
     start_seconds: float,
     end_seconds: float,
     speaker_id: int | None,
+    audio_channel: int | None,
     confidence: float | None,
     words: list[dict[str, object]],
 ) -> dict[str, object]:
@@ -153,6 +777,7 @@ def _persist_final_segment(
             start_seconds=max(0.0, start_seconds),
             end_seconds=max(start_seconds, end_seconds),
             speaker_id=speaker_id,
+            audio_channel=audio_channel,
             confidence=confidence,
             words=words or None,
         )
@@ -166,6 +791,7 @@ def _persist_final_segment(
             "start_seconds": segment.start_seconds,
             "end_seconds": segment.end_seconds,
             "speaker_id": segment.speaker_id,
+            "audio_channel": segment.audio_channel,
             "confidence": segment.confidence,
             "words": segment.words,
             "created_at": segment.created_at.isoformat(),
@@ -179,12 +805,14 @@ async def _read_deepgram_results(
     meeting_id: str,
     session_factory: sessionmaker[Session],
     send_lock: asyncio.Lock,
+    audio_timeline: AudioTimeline,
 ) -> None:
     async def send_to_browser(payload: dict[str, object]) -> None:
         async with send_lock:
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_json(payload)
 
+    last_interim_log_at = 0.0
     try:
         async for raw in upstream:
             try:
@@ -200,6 +828,8 @@ async def _read_deepgram_results(
                 continue
 
             if result.get("type") != "Results":
+                if result.get("type") in {"Metadata", "SpeechStarted", "UtteranceEnd", "CloseStream"}:
+                    logger.debug("Deepgram event for meeting %s: %s", meeting_id, result.get("type"))
                 continue
 
             channel_payload = result.get("channel") or {}
@@ -209,61 +839,143 @@ async def _read_deepgram_results(
             alternative = channels[0]
             transcript = str(alternative.get("transcript") or "").strip()
             if not transcript:
+                logger.debug(
+                    "Deepgram returned an empty transcript result: meeting_id=%s final=%s speech_final=%s",
+                    meeting_id, result.get("is_final"), result.get("speech_final"),
+                )
                 continue
 
             try:
-                start_seconds = float(result.get("start") or 0.0)
-                duration = float(result.get("duration") or 0.0)
+                stream_start_seconds = float(result.get("start") or 0.0)
+                duration = max(0.0, float(result.get("duration") or 0.0))
             except (TypeError, ValueError):
-                start_seconds, duration = 0.0, 0.0
-            end_seconds = start_seconds + max(0.0, duration)
+                stream_start_seconds, duration = 0.0, 0.0
+            # The desktop app suppresses long silent stretches before they reach Deepgram
+            # to avoid paying for silence. Restore those gaps so transcript timestamps
+            # still line up with the real meeting elapsed time.
+            start_seconds = audio_timeline.map_time(stream_start_seconds)
+            end_seconds = max(start_seconds, audio_timeline.map_time(stream_start_seconds + duration))
             is_final = bool(result.get("is_final"))
             speech_final = bool(result.get("speech_final"))
             raw_words = alternative.get("words") or []
             words = [word for word in raw_words if isinstance(word, dict)]
             speaker_values = [word.get("speaker") for word in words if word.get("speaker") is not None]
             speaker_id = int(speaker_values[0]) if speaker_values else None
+            # Deepgram returns [channel_number, total_channels]. Persist the channel only
+            # for split-channel audio, where channel 0 is meeting playback and channel 1
+            # is the local microphone. A mono mixed stream has no trustworthy source label.
+            channel_index = result.get("channel_index")
+            audio_channel: int | None = None
+            if audio_timeline.channels > 1 and isinstance(channel_index, list) and channel_index:
+                try:
+                    candidate_channel = int(channel_index[0])
+                    if 0 <= candidate_channel < audio_timeline.channels:
+                        audio_channel = candidate_channel
+                except (TypeError, ValueError):
+                    audio_channel = None
             confidence_value = alternative.get("confidence")
             confidence = float(confidence_value) if isinstance(confidence_value, (int, float)) else None
 
             if is_final:
-                try:
-                    segment = _persist_final_segment(
-                        session_factory,
-                        meeting_id,
-                        text_value=transcript,
-                        start_seconds=start_seconds,
-                        end_seconds=end_seconds,
-                        speaker_id=speaker_id,
-                        confidence=confidence,
-                        words=words,
-                    )
-                except Exception:
-                    logger.exception("Could not persist transcript segment for meeting %s", meeting_id)
-                    await send_to_browser({"type": "transcription.error", "message": "A finalized transcript segment could not be saved."})
-                    continue
+                logger.info(
+                    "Deepgram final transcript received: meeting_id=%s speech_final=%s chars=%d languages=%s",
+                    meeting_id, speech_final, len(transcript), alternative.get("languages") or [],
+                )
             else:
-                segment = {
-                    "id": f"interim-{start_seconds:.3f}",
-                    "meeting_id": meeting_id,
-                    "text": transcript,
-                    "start_seconds": start_seconds,
-                    "end_seconds": end_seconds,
-                    "speaker_id": speaker_id,
-                    "confidence": confidence,
-                    "words": words or None,
-                    "is_final": False,
-                }
+                # Interim hypotheses are sent about once per second. Log only a
+                # rate-limited, text-free heartbeat so latency can be diagnosed
+                # without copying private meeting content into backend logs.
+                now = time.monotonic()
+                if now - last_interim_log_at >= 2.0:
+                    logger.info(
+                        "Deepgram interim transcript update: meeting_id=%s chars=%d languages=%s",
+                        meeting_id, len(transcript), alternative.get("languages") or [],
+                    )
+                    last_interim_log_at = now
 
+            if is_final:
+                # A result can contain several people. Split it at speaker changes so each
+                # persisted segment has exactly one speaker label.
+                runs = split_words_by_speaker(words)
+                if len(runs) > 1:
+                    pieces = []
+                    for run in runs:
+                        piece_start = audio_timeline.map_time(run.start) if run.start is not None else start_seconds
+                        piece_end = audio_timeline.map_time(run.end) if run.end is not None else end_seconds
+                        pieces.append({
+                            "text": run.text,
+                            "start": max(start_seconds, piece_start),
+                            "end": max(piece_start, piece_end),
+                            "speaker_id": run.speaker_id,
+                            "words": run.words,
+                        })
+                else:
+                    pieces = [{
+                        "text": transcript, "start": start_seconds, "end": end_seconds,
+                        "speaker_id": speaker_id, "words": words,
+                    }]
+                for piece in pieces:
+                    try:
+                        segment = _persist_final_segment(
+                            session_factory,
+                            meeting_id,
+                            text_value=piece["text"],
+                            start_seconds=piece["start"],
+                            end_seconds=piece["end"],
+                            speaker_id=piece["speaker_id"],
+                            audio_channel=audio_channel,
+                            confidence=confidence,
+                            words=piece["words"],
+                        )
+                    except Exception:
+                        logger.exception("Could not persist transcript segment for meeting %s", meeting_id)
+                        await send_to_browser({"type": "transcription.error", "message": "A finalized transcript segment could not be saved."})
+                        continue
+                    await send_to_browser({
+                        "type": "transcript.segment",
+                        "meeting_id": meeting_id,
+                        "segment": segment,
+                        "is_final": True,
+                        "speech_final": speech_final,
+                    })
+                continue
+
+            # Interim results are transient; label them with the most recent speaker.
+            interim_speaker = int(speaker_values[-1]) if speaker_values else None
+            segment = {
+                "id": f"interim-{start_seconds:.3f}",
+                "meeting_id": meeting_id,
+                "text": transcript,
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+                "speaker_id": interim_speaker,
+                "audio_channel": audio_channel,
+                "confidence": confidence,
+                "words": words or None,
+                "is_final": False,
+            }
             await send_to_browser({
                 "type": "transcript.segment",
                 "meeting_id": meeting_id,
                 "segment": segment,
-                "is_final": is_final,
+                "is_final": False,
                 "speech_final": speech_final,
             })
-    except ConnectionClosed:
-        logger.info("Deepgram stream closed for meeting %s", meeting_id)
+
+    except ConnectionClosed as exc:
+        logger.warning(
+            "Deepgram streaming WebSocket closed: meeting_id=%s close_code=%s close_reason=%s",
+            meeting_id, getattr(exc, "code", None), getattr(exc, "reason", None),
+        )
+        if getattr(exc, "code", None) not in {1000, 1001}:
+            try:
+                await send_to_browser({
+                    "type": "transcription.error",
+                    "code": "deepgram_stream_closed",
+                    "message": "Deepgram closed the transcription stream before more transcript results arrived. Check the selected audio source and restart capture.",
+                })
+            except Exception:
+                pass
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -282,6 +994,7 @@ async def meeting_websocket(
 ) -> None:
     await websocket.accept()
     with session_factory() as session:
+        memory_schema_ready = _memory_schema_ready(session.get_bind())
         meeting = session.get(Meeting, meeting_id)
         if meeting is None:
             await websocket.send_json({"type": "error", "message": "Meeting session not found."})
@@ -298,8 +1011,13 @@ async def meeting_websocket(
 
     upstream: ClientConnection | None = None
     transcription_task: asyncio.Task[None] | None = None
+    keepalive_task: asyncio.Task[None] | None = None
+    upstream_send_lock = asyncio.Lock()
+    audio_timeline = AudioTimeline()
     send_lock = asyncio.Lock()
     audio_chunk_count = 0
+    # Cost control: Groq is never called from this WebSocket. Extraction runs once
+    # after the meeting is ended and the final transcript has been flushed.
 
     async def send_to_browser(payload: dict[str, object]) -> None:
         async with send_lock:
@@ -307,15 +1025,24 @@ async def meeting_websocket(
                 await websocket.send_json(payload)
 
     async def finish_transcription_stream() -> None:
-        nonlocal upstream, transcription_task
+        nonlocal upstream, transcription_task, keepalive_task
         current_upstream = upstream
         current_task = transcription_task
+        current_keepalive = keepalive_task
         upstream = None
         transcription_task = None
+        keepalive_task = None
+        if current_keepalive is not None:
+            current_keepalive.cancel()
+            try:
+                await current_keepalive
+            except asyncio.CancelledError:
+                pass
         if current_upstream is not None:
             try:
-                await current_upstream.send(json.dumps({"type": "Finalize"}))
-                await current_upstream.send(json.dumps({"type": "CloseStream"}))
+                async with upstream_send_lock:
+                    await current_upstream.send(json.dumps({"type": "Finalize"}))
+                    await current_upstream.send(json.dumps({"type": "CloseStream"}))
             except Exception:
                 logger.info("Could not gracefully finalize Deepgram stream for %s", meeting_id)
             try:
@@ -331,6 +1058,7 @@ async def meeting_websocket(
             except Exception:
                 pass
 
+    ACTIVE_MEETING_CONNECTIONS[meeting_id] = ACTIVE_MEETING_CONNECTIONS.get(meeting_id, 0) + 1
     try:
         while True:
             message = await websocket.receive()
@@ -366,17 +1094,97 @@ async def meeting_websocket(
                         })
                         continue
 
-                    query = urlencode({
-                        "model": settings.deepgram_model,
-                        "language": settings.deepgram_language,
-                        "interim_results": "true",
-                        "punctuate": "true",
-                        "smart_format": "true",
-                        "diarize_model": "latest",
-                        "endpointing": "300",
-                        "utterance_end_ms": "1000",
-                        "vad_events": "true",
-                    })
+                    query_params: list[tuple[str, str]] = [
+                        ("model", settings.deepgram_model),
+                        ("language", settings.deepgram_language),
+                        ("interim_results", "true"),
+                        ("punctuate", "true"),
+                        ("smart_format", "true"),
+                        ("diarize_model", "latest"),
+                        ("endpointing", "300"),
+                        ("utterance_end_ms", "1000"),
+                        ("vad_events", "true"),
+                    ]
+                    query_params.extend(keyterm_params(settings.deepgram_model, settings.keyterms))
+                    language_note = language_warning(settings.deepgram_language, settings.language_hints)
+                    if language_note:
+                        logger.warning(language_note)
+                    logger.info(
+                        "Opening Deepgram stream: model=%s language=%s hints=%s keyterms=%d",
+                        settings.deepgram_model, settings.deepgram_language,
+                        ",".join(settings.language_hints) or "none", len(settings.keyterms),
+                    )
+                    # Desktop sends split-source stereo PCM; browser capture can send a
+                    # stereo WebM/Opus container when meeting audio and mic are separate.
+                    audio_format = str(payload.get("audio_format") or "container").lower()
+                    sample_rate = 48000
+                    channels = 1
+                    wants_multichannel = str(payload.get("multichannel", "false")).lower() in {"true", "1", "yes"}
+                    if audio_format == "linear16":
+                        try:
+                            sample_rate = int(payload.get("sample_rate") or 48000)
+                            channels = int(payload.get("channels") or 1)
+                        except (TypeError, ValueError):
+                            await send_to_browser({
+                                "type": "transcription.error",
+                                "code": "invalid_audio_format",
+                                "message": "PCM audio sample_rate and channels must be integers.",
+                            })
+                            continue
+                        if sample_rate < 8000 or sample_rate > 96000 or channels not in {1, 2}:
+                            await send_to_browser({
+                                "type": "transcription.error",
+                                "code": "invalid_audio_format",
+                                "message": "PCM audio must use a sample rate from 8000 to 96000 Hz and 1 or 2 channels.",
+                            })
+                            continue
+                        query_params.extend([
+                            ("encoding", "linear16"),
+                            ("sample_rate", str(sample_rate)),
+                            ("channels", str(channels)),
+                        ])
+                    elif audio_format == "container":
+                        try:
+                            declared_channels = int(payload.get("channels") or 1)
+                        except (TypeError, ValueError):
+                            await send_to_browser({
+                                "type": "transcription.error",
+                                "code": "invalid_audio_format",
+                                "message": "Container audio channels must be an integer.",
+                            })
+                            continue
+                        if declared_channels not in {1, 2} or (wants_multichannel and declared_channels != 2):
+                            await send_to_browser({
+                                "type": "transcription.error",
+                                "code": "invalid_audio_format",
+                                "message": "Container audio must declare one channel, or two channels when multichannel is enabled.",
+                            })
+                            continue
+                        channels = declared_channels
+                    else:
+                        await send_to_browser({
+                            "type": "transcription.error",
+                            "code": "unsupported_audio_format",
+                            "message": "Unsupported audio_format. Use 'container' for browser audio or 'linear16' for signed PCM.",
+                        })
+                        continue
+
+                    if wants_multichannel:
+                        if channels != 2:
+                            await send_to_browser({
+                                "type": "transcription.error",
+                                "code": "invalid_audio_format",
+                                "message": "Multichannel transcription requires a two-channel audio stream.",
+                            })
+                            continue
+                        if audio_format == "container":
+                            # Container formats still need the declared channel count for
+                            # Deepgram to decode and transcribe each audio track separately.
+                            query_params.append(("channels", "2"))
+                        query_params.append(("multichannel", "true"))
+                    if settings.deepgram_language.strip().lower() == "multi":
+                        query_params.extend(("language_hint", hint) for hint in settings.language_hints)
+                    query = urlencode(query_params)
                     url = f"wss://api.deepgram.com/v1/listen?{query}"
                     try:
                         upstream = await upstream_connect(
@@ -407,15 +1215,42 @@ async def meeting_websocket(
                             await websocket.close(code=4409, reason="Meeting session has ended")
                             return
                         source = payload.get("source")
-                        if source in {"tab", "microphone"}:
+                        if source in {"tab", "desktop", "microphone", "desktop_auto", "web_auto"}:
                             current_meeting.audio_source = source
                             session.commit()
 
+                    audio_timeline.reset(
+                        raw_pcm=audio_format == "linear16",
+                        sample_rate=sample_rate,
+                        channels=channels,
+                    )
+                    # Resuming capture in an existing session must continue the meeting clock
+                    # instead of restarting timestamps at zero.
+                    audio_timeline.base_offset = _resume_offset_seconds(session_factory, meeting_id)
                     transcription_task = asyncio.create_task(
-                        _read_deepgram_results(upstream, websocket, meeting_id, session_factory, send_lock)
+                        _read_deepgram_results(
+                            upstream,
+                            websocket,
+                            meeting_id,
+                            session_factory,
+                            send_lock,
+                            audio_timeline,
+                        )
+                    )
+                    keepalive_task = asyncio.create_task(
+                        _keep_deepgram_alive(upstream, upstream_send_lock, meeting_id)
                     )
                     await send_to_browser({"type": "transcription.ready", "meeting_id": meeting_id, "provider": "deepgram", "model": settings.deepgram_model})
-                    logger.info("Deepgram stream started: meeting_id=%s source=%s mime_type=%s", meeting_id, payload.get("source"), payload.get("mime_type", "unknown"))
+                    logger.info(
+                        "Deepgram streaming WebSocket connected: meeting_id=%s source=%s mime_type=%s model=%s language=%s channels=%s multichannel=%s; one streaming session, not one REST request per audio chunk",
+                        meeting_id, payload.get("source"), payload.get("mime_type", "unknown"),
+                        settings.deepgram_model, settings.deepgram_language, channels, wants_multichannel,
+                    )
+                    if str(payload.get("audio_format") or "container").lower() == "linear16":
+                        logger.info(
+                            "Raw PCM stream configured: meeting_id=%s sample_rate=%s channels=%s multichannel=%s encoding=linear16",
+                            meeting_id, payload.get("sample_rate", 48000), payload.get("channels", 1), wants_multichannel,
+                        )
                     await send_to_browser({"type": "message.received", "meeting_id": meeting_id, "message_type": "audio.start"})
                     continue
 
@@ -436,14 +1271,25 @@ async def meeting_websocket(
                     await send_to_browser({"type": "error", "code": "transcription_stream_not_started", "message": "Start audio capture after transcription is ready. Check that DEEPGRAM_API_KEY is configured."})
                     continue
                 try:
-                    await upstream.send(audio_chunk)
+                    async with upstream_send_lock:
+                        await upstream.send(audio_chunk)
+                    audio_timeline.record_chunk(len(audio_chunk))
                 except Exception:
                     logger.exception("Could not forward audio chunk to Deepgram for meeting %s", meeting_id)
                     await send_to_browser({"type": "transcription.error", "message": "Could not forward audio to the transcription provider. Stop and restart capture."})
                     continue
 
                 audio_chunk_count += 1
-                logger.info("Audio chunk forwarded: meeting_id=%s chunk_number=%d byte_length=%d", meeting_id, audio_chunk_count, len(audio_chunk))
+                if audio_chunk_count == 1 or audio_chunk_count % 10 == 0 or len(audio_chunk) > 1000:
+                    logger.info(
+                        "Audio forwarded to Deepgram: meeting_id=%s chunks=%d latest_byte_length=%d",
+                        meeting_id, audio_chunk_count, len(audio_chunk),
+                    )
+                else:
+                    logger.debug(
+                        "Small audio chunk forwarded: meeting_id=%s chunk_number=%d byte_length=%d",
+                        meeting_id, audio_chunk_count, len(audio_chunk),
+                    )
                 await send_to_browser({
                     "type": "audio.chunk.received",
                     "meeting_id": meeting_id,
@@ -453,4 +1299,9 @@ async def meeting_websocket(
     except WebSocketDisconnect:
         logger.info("Meeting WebSocket disconnected: %s", meeting_id)
     finally:
+        remaining = ACTIVE_MEETING_CONNECTIONS.get(meeting_id, 1) - 1
+        if remaining > 0:
+            ACTIVE_MEETING_CONNECTIONS[meeting_id] = remaining
+        else:
+            ACTIVE_MEETING_CONNECTIONS.pop(meeting_id, None)
         await finish_transcription_stream()
