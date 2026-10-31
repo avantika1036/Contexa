@@ -1,0 +1,29 @@
+{
+  "name": "contexa-desktop",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs",
+  "description": "Contexa Windows desktop application with meeting capture and local UI.",
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check main.mjs && node --check ui-server.mjs && node --check meeting-session.mjs && node --check meeting-api.mjs && node --check mic-reader.mjs && node --check capture-policy.mjs && node --check frame-pacer.mjs && node --check sample-queue.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@audio/mic": "^1.4.0",
+    "dotenv": "^17.2.3",
+    "loopback-capture": "^3.0.2",
+    "ws": "^8.18.3"
+  },
+  "optionalDependencies": {
+    "@audio/mic-win32-x64": "^1.4.0"
+  },
+  "devDependencies": {
+    "electron": "^39.0.0"
+  },
+  "allowScripts": {
+    "electron@39.8.10": true
+  },
+  "productName": "Contexa"
+}
