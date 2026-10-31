@@ -1,88 +1,124 @@
 # Contexa
 
-A real-time AI copilot that builds structured meeting memory to help participants recover context, track decisions, and get grounded answers during live discussions.
+Contexa is a real-time meeting context copilot. It listens to a meeting you are in, keeps a
+structured, timestamped memory of what was said, and lets you ask questions grounded in that
+record, so you can recover context when your attention drifts.
 
-## Current development status
+> **Status: working MVP foundation (Windows only).** Capture, transcription, structured memory
+> and grounded Q&A work. Live (mid-meeting) memory, time-range *Catch me up*, *I'm lost*,
+> semantic search and contradiction handling are in progress. See [Roadmap](#roadmap).
 
-- React + TypeScript meeting workspace
-- FastAPI backend with WebSocket support
-- PostgreSQL + pgvector configured through Docker Compose
-- Persisted meeting sessions with unique IDs, statuses, and start/end timestamps
-- Browser audio capture streamed to the selected session's WebSocket
-- Streaming transcription, structured meeting memory, and grounded answers are upcoming milestones
+## What works today
 
-## Local development
+| Area | Status |
+|---|---|
+| Meeting detection (Zoom, Teams, Webex, browser meetings) | Best-effort process/window heuristics; platform-specific call-state integrations remain future work |
+| Audio: meeting app audio + your microphone on separate channels | Implemented; verify against actual Windows meeting devices |
+| Streaming transcription (Deepgram Nova-3, multilingual) | Implemented; real-device latency/accuracy validation ongoing |
+| Speaker labels per transcript segment | Working (`Speaker N`; no real names yet) |
+| Session deduplication | Database-backed for explicit stable IDs; heuristic/best-effort for generic native titles (see [session lifecycle](docs/session-lifecycle.md)) |
+| Structured memory (facts, proposals, arguments, decisions, questions, action items) | Working, **runs after the meeting ends** |
+| Decision lifecycle (proposed → discussing → tentative → decided) | Working; never regresses |
+| Ask Contexa (meeting-only or meeting + general context, with validated evidence quotes) | Working |
+| Live memory, Catch me up (time range), I'm lost, "already discussed?" | Not yet |
+| Embedding / semantic search (pgvector is installed but unused) | Not yet |
+| Authentication, retention settings | Not yet (run locally only) |
 
-Run commands from the repository root unless a section says otherwise.
+## Architecture
 
-### 1. Start PostgreSQL
+Electron desktop app (system tray, local React UI) → FastAPI backend (WebSocket for audio and
+live transcript) → PostgreSQL + pgvector. Deepgram handles speech-to-text; Groq's
+OpenAI-compatible API handles memory extraction and Q&A. Raw audio is streamed for
+transcription and is **never stored**.
+
+See [docs/architecture.md](docs/architecture.md) for details.
+
+## Setup (Windows 10/11)
+
+Prerequisites: Python 3.11+, Node.js LTS, Docker Desktop.
+
+1. Copy `.env.example` to `.env` and fill in `POSTGRES_PASSWORD`, `DATABASE_URL`,
+   `DEEPGRAM_API_KEY` and `GROQ_API_KEY`. Never commit `.env`.
+2. Run `Start-Contexa.ps1` once. It creates the Python virtual environment, installs
+   dependencies, builds the UI and launches the desktop app.
+3. Database migrations are applied automatically when the desktop app starts its local
+   services. To check or apply them manually (for example after a failure), run:
+
+   ```powershell
+   Set-Location .\backend
+   .\run_migrations.ps1
+   ```
+
+4. Afterwards, start Contexa with `Open-Contexa.vbs` or the desktop shortcut.
+
+## Everyday use
+
+On first launch Contexa asks for recording consent once. After you accept, **Auto Capture is on
+by default at every launch**. You can pause it from the tray menu or the sidebar; a pause is
+remembered across restarts until you turn it back on. When a supported
+meeting window is detected, Contexa captures that application's audio plus your microphone
+and shows the live transcript. Open a meeting in the sidebar to see its memory, decisions and
+the **Ask** tab.
+
+## Development
 
 ```powershell
-docker compose up -d postgres
+# Backend tests (uses an in-memory SQLite database; never calls Groq or Deepgram)
+Set-Location .\backend
+$env:DATABASE_URL = "sqlite+pysqlite:///:memory:"
+python -m pytest -q
+
+# Desktop tests and syntax check
+Set-Location ..\desktop
+npm run check
+npm test
+
+# Frontend
+Set-Location ..\frontend
+npm run build
+npm run lint
 ```
 
-### 2. Install backend dependencies and apply database migrations
+## Privacy
 
-```powershell
-Set-Location backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-alembic upgrade head
-```
+- Capture starts only after explicit consent in the app, and only while a recognized meeting
+  window is open.
+- Raw audio is not saved. Finalized transcript text and extracted memory are stored in your
+  local PostgreSQL database.
+- Transcript text is sent to Groq when memory extraction or Ask Contexa runs, and audio is
+  sent to Deepgram for transcription.
+- Browser meetings are captured by browser process, so other audible tabs in the same browser
+  may be included. Prefer the native Zoom/Teams apps, or close other audio tabs, when this
+  matters.
+- Delete a meeting with `DELETE /api/meetings/{id}`. There is no authentication yet, so keep
+  the backend on localhost.
 
-If the virtual environment already exists, activate it instead of creating it again.
+## Known limitations
 
-### 3. Run the backend
+- Detection relies on window titles and process names, so unusual or localized titles can be
+  missed or misdetected. Explicit meeting IDs receive database-backed deduplication; generic
+  native meeting titles remain best-effort until client-specific meeting-state integration exists.
+- Speaker labels come from Deepgram diarization and are approximate on mixed audio. Names are
+  not inferred.
+- Memory extraction can be wrong or incomplete; every item keeps its evidence quote and
+  timestamp so it can be checked.
 
-From `backend/` with its virtual environment active:
+## Roadmap
 
-```powershell
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
+1. Session identity and duplicate prevention (implemented for stable IDs; Windows validation outstanding)
+2. Meeting-aware detection and meeting-specific browser audio
+3. Reliable audio capture and speaker attribution under real Windows meeting conditions
+4. Live incremental memory with a durable job queue and per-meeting request/token budgets
+5. Catch me up (time range), I'm lost, "was this already discussed?"
+6. Semantic search (pgvector), contradiction handling, speaker names
+7. Evaluation set, delete/retention controls, authentication, installer
 
-API docs: http://127.0.0.1:8000/docs
+## Documentation
 
-### 4. Run the frontend
-
-In a separate terminal:
-
-```powershell
-Set-Location frontend
-npm install
-npm run dev -- --host 127.0.0.1
-```
-
-Open http://127.0.0.1:5173/.
-
-### 5. Run backend tests
-
-From `backend/` with the virtual environment active:
-
-```powershell
-python -m pytest tests -q
-```
-
-Tests use an isolated in-memory SQLite database; they do not write test meeting records to your development PostgreSQL database.
-
-## Audio capture behavior
-
-Audio capture requires explicit user confirmation and browser permission. Browser-tab audio depends on browser/source support and the audio-sharing option selected in the browser picker. Microphone-only capture is available as a fallback. Audio chunks are currently acknowledged by the backend but are not transcribed or persisted yet.
-
-## Security
-
-- Keep `.env` and all credentials out of Git.
-- Do not expose the development backend publicly; authentication and authorization are not implemented yet.
-- Only capture a meeting when you have appropriate consent and permission.
-
-
-## Audio Capture Troubleshooting
-
-See [docs/audio-capture-troubleshooting.md](docs/audio-capture-troubleshooting.md) for microphone permissions, browser tab audio, and server-side diagnostics.
-
-
-## Real-time transcription (Deepgram)
-
-Contexa supports streaming speech-to-text through Deepgram. Copy `.env.example` to the repository-root `.env` only if you do not already have a `.env` file, then set `DEEPGRAM_API_KEY` to a valid key from the [Deepgram Console](https://console.deepgram.com/). Preserve your existing database settings. A provider account/key may be subject to the provider’s current usage limits and pricing. Never commit `.env` or share the key. Restart FastAPI after changing it.
-
-Apply database changes from `backend/` with `python -m alembic upgrade head`. The live transcript endpoint persists finalized transcript segments and exposes them at `/api/meetings/{meeting_id}/transcript`. Interim results are transient. Audio chunks themselves are not stored by Contexa.
+- [Architecture](docs/architecture.md)
+- [Session lifecycle](docs/session-lifecycle.md)
+- [Transcription settings and provider choice](docs/transcription.md)
+- [Structured memory](docs/structured-memory.md)
+- [Ask Contexa](docs/meeting-qa.md)
+- [Audio capture troubleshooting](docs/audio-capture-troubleshooting.md)
+- Older patch notes: `docs/archive/patches/` (historical, not current instructions)
