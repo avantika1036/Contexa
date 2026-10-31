@@ -1,4 +1,4 @@
-﻿# Environment secrets
+# Environment secrets
 .env
 .env.*
 !.env.example
@@ -13,20 +13,27 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
 
-# Node.js
+# Node/Electron
 node_modules/
 **/node_modules/
 frontend/dist/
 frontend/.vite/
+desktop/dist/
+desktop/out/
+release/
 
-# Logs and local databases
+# Runtime and local databases
 *.log
 *.sqlite3
 *.db
+
+# Local exports / nested backups
+*.zip
 
 # Editor and operating system files
 .vscode/
