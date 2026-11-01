@@ -103,3 +103,43 @@ test('resume helper preserves HTTP status so ended sessions can be recovered saf
     (error) => error.status === 409 && /has ended/.test(error.message),
   );
 });
+
+import { upgradeMeetingIdentitySession } from '../meeting-api.mjs';
+
+test('identity upgrade persists the stable call key and corrected title on the existing session', async () => {
+  const calls = [];
+  const result = await upgradeMeetingIdentitySession({
+    apiBase: 'http://127.0.0.1:8000',
+    meetingId: 'provisional-session',
+    sessionKey: 'meet:fai-wivv-szk',
+    title: 'Meet - fai-wivv-szk',
+    processName: 'chrome',
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return response(200, { id: 'provisional-session', title: 'Auto · Meet - fai-wivv-szk', status: 'active' });
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'http://127.0.0.1:8000/api/meetings/provisional-session/identity');
+  assert.equal(calls[0].options.method, 'PATCH');
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    capture_key: 'meet:fai-wivv-szk',
+    title: 'Auto · Meet - fai-wivv-szk',
+    process_name: 'chrome',
+  });
+  assert.equal(result.title, 'Auto · Meet - fai-wivv-szk');
+});
+
+test('identity upgrade preserves the HTTP status for an existing stable-identity conflict', async () => {
+  await assert.rejects(
+    upgradeMeetingIdentitySession({
+      apiBase: 'http://127.0.0.1:8000',
+      meetingId: 'provisional-session',
+      sessionKey: 'meet:fai-wivv-szk',
+      title: 'Meet - fai-wivv-szk',
+      processName: 'chrome',
+      fetchImpl: async () => response(409, { detail: 'Another open session owns the identity.' }),
+    }),
+    (error) => error.status === 409 && /Another open session/.test(error.message),
+  );
+});

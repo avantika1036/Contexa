@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { captureStopReason, selectStartCandidate } from '../capture-policy.mjs';
+import { captureStopReason, selectStartCandidate, isSupportedMeetingWindow, normalizeDesktopWindows, normalizeMeetingWindows } from '../capture-policy.mjs';
+import { hasSameBrowserProcessWindow } from '../meeting-session.mjs';
 
 const base = { startedAt: 0, lastMatchedAt: 0, lastAudibleAt: 0 };
 
@@ -83,4 +84,63 @@ test('Auto Capture is never on without recorded consent', () => {
   assert.equal(resolveAutoCapture({ consentVersion: 0 }), false);
   assert.equal(resolveAutoCapture({ consentVersion: 0, autoCapturePausedByUser: false }), false);
   assert.equal(resolveAutoCapture({}), false);
+});
+
+
+test('a Google Meet call-code title remains detectable after Electron restarts', () => {
+  assert.equal(isSupportedMeetingWindow('chrome', 'Meet - emh-saes-zmn'), true);
+  assert.equal(isSupportedMeetingWindow('chrome', 'Meet - fai-wivv-szk - Google Chrome'), true);
+  assert.equal(isSupportedMeetingWindow('msedge', 'Meet – emh-saes-zmn – Microsoft Edge'), true);
+});
+
+test('Google Meet detection does not accept unrelated browser windows', () => {
+  assert.equal(isSupportedMeetingWindow('chrome', 'New Tab - Google Chrome'), false);
+  assert.equal(isSupportedMeetingWindow('chrome', 'Google Docs - abc-defg-hij'), false);
+  assert.equal(isSupportedMeetingWindow('chrome', 'Meet settings - Google Chrome'), false);
+});
+
+
+test('normalizes all top-level browser windows instead of relying on one process main title', () => {
+  const windows = normalizeMeetingWindows([
+    { pid: 36380, processName: 'chrome', title: 'New Tab - Google Chrome', foreground: true },
+    { pid: 36380, processName: 'chrome', title: 'Meet - fai-wivv-szk - Google Chrome', foreground: false },
+    { pid: 36380, processName: 'chrome', title: 'Google Docs', foreground: false },
+  ]);
+
+  assert.equal(windows.length, 1);
+  assert.deepEqual(windows[0], {
+    pid: 36380,
+    processName: 'chrome',
+    title: 'Meet - fai-wivv-szk',
+    foreground: false,
+  });
+});
+
+test('normalizes a single PowerShell window object as well as an array', () => {
+  const window = normalizeMeetingWindows({
+    pid: 42, processName: 'chrome', title: 'Meet - emh-saes-zmn', foreground: true,
+  });
+  assert.equal(window.length, 1);
+  assert.equal(window[0].title, 'Meet - emh-saes-zmn');
+});
+
+
+test('desktop window snapshot retains ordinary browser tabs for continuity checks', () => {
+  const windows = normalizeDesktopWindows([
+    { pid: 36380, processName: 'chrome', title: 'Docs - Google Chrome', foreground: true },
+    { pid: 36380, processName: 'chrome', title: 'Meet - fai-wivv-szk - Google Chrome', foreground: false },
+    { pid: 99, processName: 'notepad', title: 'Notes', foreground: false },
+  ]);
+  assert.equal(windows.length, 3);
+  assert.equal(windows[0].title, 'Docs');
+  assert.equal(normalizeMeetingWindows(windows).length, 1);
+});
+
+test('a temporary title change does not count as a missing browser process window', () => {
+  const windows = normalizeDesktopWindows([
+    { pid: 36380, processName: 'chrome', title: 'Calendar - Google Chrome', foreground: true },
+  ]);
+  assert.equal(hasSameBrowserProcessWindow(windows, {
+    processId: 36380, processName: 'chrome', sessionKey: 'meet:fai-wivv-szk',
+  }), true);
 });

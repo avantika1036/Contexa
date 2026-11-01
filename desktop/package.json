@@ -7,7 +7,7 @@
   "description": "Contexa Windows desktop application with meeting capture and local UI.",
   "scripts": {
     "start": "electron .",
-    "check": "node --check main.mjs && node --check ui-server.mjs && node --check meeting-session.mjs && node --check meeting-api.mjs && node --check mic-reader.mjs && node --check capture-policy.mjs && node --check frame-pacer.mjs && node --check sample-queue.mjs",
+    "check": "node --check audio-meter.mjs && node --check main.mjs && node --check ui-server.mjs && node --check meeting-session.mjs && node --check meeting-identity.mjs && node --check meeting-api.mjs && node --check mic-reader.mjs && node --check microphone-devices.mjs && node --check capture-policy.mjs && node --check frame-pacer.mjs && node --check sample-queue.mjs",
     "test": "node --test"
   },
   "dependencies": {

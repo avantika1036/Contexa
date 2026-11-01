@@ -89,3 +89,32 @@ export function suspendMeetingSession(args) {
 export function resumeMeetingSession(args) {
   return meetingStateRequest({ ...args, state: 'resume' });
 }
+
+
+export async function upgradeMeetingIdentitySession({
+  apiBase,
+  meetingId,
+  sessionKey,
+  title,
+  processName,
+  fetchImpl = fetch,
+}) {
+  const response = await fetchImpl(`${apiBase}/api/meetings/${encodeURIComponent(meetingId)}/identity`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      capture_key: sessionKey,
+      title: String(title || 'Meeting').startsWith('Auto · ') ? title : `Auto · ${title || 'Meeting'}`,
+      process_name: processName || null,
+    }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!response.ok) {
+    let detail = `Request failed (${response.status}).`;
+    try { detail = (await response.text()) || detail; } catch { /* keep status detail */ }
+    const error = new Error(`Could not persist Contexa meeting identity (${response.status}): ${detail}`);
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
+}

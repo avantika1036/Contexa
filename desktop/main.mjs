@@ -8,14 +8,17 @@ import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import WebSocket from 'ws';
 import loopback from 'loopback-capture';
-import mic from '@audio/mic';
+import mic, { devices as listMicrophoneDevices } from '@audio/mic';
 import { startUiServer } from './ui-server.mjs';
-import { meetingKey, classifyWindowTransition, SessionContinuity, graceForKey } from './meeting-session.mjs';
-import { createMeetingSession, resumeMeetingSession, suspendMeetingSession } from './meeting-api.mjs';
+import { meetingKey, classifyWindowTransition, SessionContinuity, graceForKey, shouldKeepBrowserCaptureDuringTabSwitch } from './meeting-session.mjs';
+import { createMeetingSession, resumeMeetingSession, suspendMeetingSession, upgradeMeetingIdentitySession } from './meeting-api.mjs';
 import { pumpReader } from './mic-reader.mjs';
-import { captureStopReason, selectStartCandidate, resolveAutoCapture } from './capture-policy.mjs';
+import { selectMicrophoneDevice, isRecoverableMicrophoneDeviceError, microphoneRetryDelayMs, waitForStableMicrophoneDevice } from './microphone-devices.mjs';
+import { captureStopReason, selectStartCandidate, resolveAutoCapture, normalizeDesktopWindows, normalizeMeetingWindows } from './capture-policy.mjs';
 import { FramePacer } from './frame-pacer.mjs';
 import { SampleQueue } from './sample-queue.mjs';
+import { measurePcm16StereoChannel, isPcmChannelActive } from './audio-meter.mjs';
+import { resolveStableMeetingWindow } from './meeting-identity.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,10 +50,6 @@ const PCM_RATE = 48000;
 const OUTPUT_FRAME_MS = 100;
 const MIXER_TICK_MS = 20;
 const FRAME_SAMPLES = PCM_RATE * OUTPUT_FRAME_MS / 1000;
-const CAPTURED_PROCESS_NAMES = new Set([
-  'zoom', 'zoomworkplace', 'zoom meetings', 'ms-teams', 'teams', 'webex',
-  'ciscocollabhost', 'chrome', 'msedge', 'brave', 'firefox',
-]);
 
 let tray;
 let mainWindow = null;
@@ -71,6 +70,7 @@ let migrationsApplied = false;
 const continuity = new SessionContinuity({ graceMs: SESSION_GRACE_MS });
 let finalizeTimer = null;
 let restartBlock = null;
+let lastMeetingWindowSnapshot = '';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -332,69 +332,70 @@ function setStartupEnabled(enabled) {
   });
 }
 
-function titleLooksLikeMeeting(processName, title) {
-  const process = String(processName || '').toLowerCase().replace(/\.exe$/, '').trim();
-  const name = String(title || '').trim();
-  const lower = name.toLowerCase();
-  if (!name || !CAPTURED_PROCESS_NAMES.has(process)) return false;
-
-  // Require a meeting/call title or a recognizable web meeting title. Merely opening
-  // Zoom, Teams, a browser, or an unrelated media app must not start microphone capture.
-  if (['zoom', 'zoomworkplace', 'zoom meetings'].includes(process)) {
-    return /\bzoom\s+meeting\b|\bmeeting\b.*\bzoom\b|\bcall\b.*\bzoom\b|\bzoom\b.*\bcall\b/i.test(name)
-      && !/home|settings|contacts|chat|schedule/i.test(lower);
-  }
-  if (['ms-teams', 'teams'].includes(process)) {
-    return /\bmeeting\b|\bcall\b|\bhuddle\b/i.test(name)
-      && /teams|meeting|call|huddle/i.test(lower)
-      && !/settings|chat list|activity/i.test(lower);
-  }
-  if (['webex', 'ciscocollabhost'].includes(process)) {
-    return /\bmeeting\b|\bcall\b|\bwebex\b/i.test(name)
-      && !/home|settings|chat|calendar/i.test(lower);
-  }
-  // Browser windows: support the standard meeting titles shown by Meet, Zoom Web,
-  // Teams and Webex. The agent targets the browser process tree, not system audio.
-  return /google meet|meet\s*[-–|].*chrome|meet\s*[-–|].*edge|meet\.google|zoom meeting|zoom\.us.*meeting|meeting.*zoom|microsoft teams.*meeting|meeting.*microsoft teams|teams\.microsoft|webex.*meeting|meeting.*webex/i.test(name)
-    && !/settings|extensions|history|downloads/i.test(lower);
-}
-
-async function getMeetingWindows() {
+async function getDesktopWindowSnapshot() {
+  // Enumerate actual top-level HWNDs rather than using Get-Process.MainWindowTitle.
+  // Chrome/Edge can have several browser windows in one process; MainWindowTitle only
+  // represents one of them, which can make an open Meet disappear from the detector.
   const script = String.raw`
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type @'
 using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
-public static class ContexaWindowFocus {
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+public static class ContexaWindowEnumerator {
+  public sealed class WindowInfo {
+    public int pid { get; set; }
+    public string processName { get; set; }
+    public string title { get; set; }
+    public bool foreground { get; set; }
+  }
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  public static List<WindowInfo> GetWindows() {
+    var rows = new List<WindowInfo>();
+    IntPtr foregroundHandle = GetForegroundWindow();
+    EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+      if (!IsWindowVisible(hWnd)) return true;
+      int length = GetWindowTextLength(hWnd);
+      if (length <= 0) return true;
+      var title = new StringBuilder(length + 1);
+      GetWindowText(hWnd, title, title.Capacity);
+      if (title.Length == 0) return true;
+      uint processId;
+      GetWindowThreadProcessId(hWnd, out processId);
+      try {
+        using (var process = Process.GetProcessById((int)processId)) {
+          rows.Add(new WindowInfo {
+            pid = (int)processId,
+            processName = process.ProcessName,
+            title = title.ToString(),
+            foreground = hWnd == foregroundHandle
+          });
+        }
+      } catch { }
+      return true;
+    }, IntPtr.Zero);
+    return rows;
+  }
 }
 '@
-[uint32]$foregroundPid = 0
-$foregroundHandle = [ContexaWindowFocus]::GetForegroundWindow()
-if ($foregroundHandle -ne [IntPtr]::Zero) { [void][ContexaWindowFocus]::GetWindowThreadProcessId($foregroundHandle, [ref]$foregroundPid) }
-$rows = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -and $_.MainWindowTitle.Trim().Length -gt 0 } | ForEach-Object {
-  [pscustomobject]@{ pid = [int]$_.Id; processName = [string]$_.ProcessName; title = [string]$_.MainWindowTitle; foreground = ([int]$_.Id -eq [int]$foregroundPid) }
-})
-ConvertTo-Json -InputObject $rows -Compress
+$rows = [ContexaWindowEnumerator]::GetWindows()
+ConvertTo-Json -InputObject @($rows) -Compress
 `;
   try {
     const { stdout } = await execFileAsync('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-    ], { windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 });
+    ], { windowsHide: true, timeout: 7000, maxBuffer: 2 * 1024 * 1024 });
     const content = stdout.trim();
     if (!content) return [];
-    const parsed = JSON.parse(content);
-    const windows = Array.isArray(parsed) ? parsed : [parsed];
-    return windows
-      .filter((window) => Number.isInteger(Number(window.pid)) && titleLooksLikeMeeting(window.processName, window.title))
-      .map((window) => ({
-        pid: Number(window.pid),
-        processName: String(window.processName),
-        title: String(window.title).replace(/\s+-\s+(Google Chrome|Microsoft Edge|Mozilla Firefox|Brave)$/i, '').trim().slice(0, 180),
-        foreground: Boolean(window.foreground),
-      }))
-      .sort((left, right) => Number(right.foreground) - Number(left.foreground));
+    return normalizeDesktopWindows(JSON.parse(content));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (message !== lastCaptureError) {
@@ -405,6 +406,9 @@ ConvertTo-Json -InputObject $rows -Compress
   }
 }
 
+async function getMeetingWindows() {
+  return normalizeMeetingWindows(await getDesktopWindowSnapshot());
+}
 
 function stereoPcmToMono(buffer) {
   const frameBytes = 4; // s16le, two channels
@@ -443,18 +447,7 @@ function createStereoFrame(appQueue, micQueue) {
 }
 
 function channelHasAudioActivity(buffer, channelIndex) {
-  const sampleCount = Math.floor(buffer.length / 4);
-  if (!sampleCount) return false;
-  let sumSquares = 0;
-  let peak = 0;
-  const channelOffset = channelIndex === 0 ? 0 : 2;
-  for (let index = 0; index < sampleCount; index += 1) {
-    const absolute = Math.abs(buffer.readInt16LE(index * 4 + channelOffset));
-    peak = Math.max(peak, absolute);
-    sumSquares += absolute * absolute;
-  }
-  const rms = Math.sqrt(sumSquares / sampleCount);
-  return rms >= 145 || (rms >= 65 && peak >= 900);
+  return isPcmChannelActive(measurePcm16StereoChannel(buffer, channelIndex));
 }
 
 async function endMeetingSession(meetingId, { discardIfEmpty = true } = {}) {
@@ -556,8 +549,17 @@ function waitForTranscriptionReady(socket) {
 
 async function startCaptureForWindow(windowInfo) {
   if (currentCapture) return;
+  const initialKey = meetingKey(windowInfo.processName, windowInfo.title);
+  windowInfo = await resolveStableMeetingWindow({
+    initialWindow: windowInfo,
+    getWindows: getMeetingWindows,
+    keyOf: (candidate) => meetingKey(candidate.processName, candidate.title),
+  });
   const title = windowInfo.title || `${windowInfo.processName} meeting`;
   const sessionKey = meetingKey(windowInfo.processName, title);
+  if (initialKey !== sessionKey) {
+    console.info(`Resolved Google Meet call identity before creating the session: ${initialKey} -> ${sessionKey}.`);
+  }
   let reusedSession = false;
   let meeting;
   let socket;
@@ -566,29 +568,224 @@ async function startCaptureForWindow(windowInfo) {
   let micPump = null;
   let mixerTimer;
   let micFailure = null;
-  let micReading = true;
+  let micReading = false;
+  let micAvailable = false;
+  let micStatus = 'connecting';
+  let micDevice = null;
+  let micGeneration = 0;
+  let micRecoveryTimer = null;
+  let micRecoveryInFlight = false;
+  let micRecoveryAttempt = 0;
+  let micRecoveryCancelled = false;
+  let microphoneCaptureReady = false;
+  let micUnavailableNotified = false;
   const appQueue = new SampleQueue(PCM_RATE * 3);
   const micQueue = new SampleQueue(PCM_RATE * 3);
-  const audioStats = { forwardedFrames: 0, suppressedSilentFrames: 0, appActiveFrames: 0, micActiveFrames: 0, micBacklogMs: 0, micDroppedMs: 0, appDroppedMs: 0, lastAudibleAt: 0 };
+  const audioStats = {
+    forwardedFrames: 0, suppressedSilentFrames: 0, appActiveFrames: 0, micActiveFrames: 0,
+    micBacklogMs: 0, micDroppedMs: 0, appDroppedMs: 0, lastAudibleAt: 0,
+    lastMicRms: 0, lastMicPeak: 0, maxMicRms: 0, maxMicPeak: 0,
+    lastAppRms: 0, lastAppPeak: 0, maxAppRms: 0, maxAppPeak: 0,
+  };
+  let lastAudioMeterLogAt = 0;
+
+  const publishMicrophoneStatus = () => {
+    if (currentCapture?.meetingId === meeting?.id) {
+      currentCapture.microphoneAvailable = micAvailable;
+      currentCapture.microphoneStatus = micStatus;
+      currentCapture.microphoneDevice = micDevice?.name || null;
+    }
+    updateTrayMenu();
+  };
+
+  const closeCurrentMicReader = () => {
+    micGeneration += 1;
+    micReading = false;
+    const pump = micPump;
+    const reader = micReader;
+    micPump = null;
+    micReader = null;
+    try { if (pump) pump.stop(); else reader?.(null); } catch (error) { console.warn('Microphone shutdown warning:', error); }
+  };
 
   const stopMicReader = () => {
-    micReading = false;
-    try { if (micPump) micPump.stop(); else micReader?.(null); } catch (error) { console.warn('Microphone shutdown warning:', error); }
+    micRecoveryCancelled = true;
+    clearTimeout(micRecoveryTimer);
+    micRecoveryTimer = null;
+    micAvailable = false;
+    micStatus = 'unavailable';
+    closeCurrentMicReader();
+    publishMicrophoneStatus();
+  };
+
+  const scheduleMicrophoneRecovery = () => {
+    if (micRecoveryCancelled || !microphoneCaptureReady || micRecoveryInFlight
+      || micRecoveryTimer || !currentCapture || currentCapture.stopping) return;
+    const delayMs = microphoneRetryDelayMs(micRecoveryAttempt);
+    micRecoveryTimer = setTimeout(() => {
+      micRecoveryTimer = null;
+      void recoverMicrophoneInput();
+    }, delayMs);
   };
 
   const handleMicError = (error) => {
     if (!micReading) return;
     micFailure = error;
     micReading = false;
+    micAvailable = false;
+    micStatus = 'reconnecting';
+    micGeneration += 1;
+    const failedPump = micPump;
+    const failedReader = micReader;
+    micPump = null;
+    micReader = null;
+    try { if (failedPump) failedPump.stop(); else failedReader?.(null); } catch (closeError) {
+      console.warn('Could not close the invalidated microphone reader cleanly:', closeError);
+    }
     console.error('Microphone capture error:', error);
-    if (currentCapture?.processId === windowInfo.pid) {
-      tray?.displayBalloon?.({ title: 'Contexa microphone unavailable', content: 'Auto Capture stopped because the microphone could not be read. Check Windows microphone privacy settings and input devices.' });
+    publishMicrophoneStatus();
+
+    if (!microphoneCaptureReady) return;
+
+    if (isRecoverableMicrophoneDeviceError(error)) {
+      lastCaptureError = 'Windows changed the microphone input. Contexa is reconnecting; the meeting session remains active.';
+      if (!micUnavailableNotified) {
+        micUnavailableNotified = true;
+        tray?.displayBalloon?.({
+          title: 'Contexa is reconnecting your microphone',
+          content: 'Windows changed the active input device. Meeting capture remains active while Contexa reconnects to the new microphone.',
+        });
+      }
+      publishMicrophoneStatus();
+      scheduleMicrophoneRecovery();
+      return;
+    }
+
+    if (currentCapture?.meetingId === meeting?.id) {
+      lastCaptureError = `Microphone input failed: ${error?.message || error}`;
+      tray?.displayBalloon?.({ title: 'Contexa microphone unavailable', content: 'The microphone could not be read. Auto Capture is stopping rather than silently omitting your voice.' });
       void stopCapture('Microphone input failed; stopping rather than silently omitting your voice');
     }
   };
 
   const handleMicChunk = (chunk) => {
     if (micReading) micQueue.push(monoPcmBufferToSamples(chunk));
+  };
+
+  const openMicrophoneInput = async ({ firstBufferTimeoutMs = 4000, selectedDevice = null } = {}) => {
+    const devices = selectedDevice ? null : await listMicrophoneDevices();
+    const selected = selectedDevice || selectMicrophoneDevice(devices, micDevice?.id || null);
+    if (!selected) {
+      throw new Error('No unambiguous Windows microphone input is available. Set a default input device in Windows Settings > System > Sound > Input.');
+    }
+
+    const generation = ++micGeneration;
+    let firstBufferReceived = false;
+    let resolveFirstBuffer;
+    let rejectFirstBuffer;
+    const firstBuffer = new Promise((resolve, reject) => {
+      resolveFirstBuffer = resolve;
+      rejectFirstBuffer = reject;
+    });
+    const reader = mic({
+      device: selected.id,
+      sampleRate: PCM_RATE,
+      channels: 1,
+      bitDepth: 16,
+      backend: 'miniaudio',
+      bufferSize: 50,
+    });
+
+    micReader = reader;
+    micReading = true;
+    micAvailable = false;
+    micStatus = 'connecting';
+    micDevice = selected;
+    micPump = pumpReader(reader, {
+      onChunk: (chunk) => {
+        if (generation !== micGeneration || !micReading) return;
+        handleMicChunk(chunk);
+        if (!firstBufferReceived) {
+          firstBufferReceived = true;
+          resolveFirstBuffer();
+        }
+      },
+      onError: (error) => {
+        if (generation !== micGeneration) return;
+        if (!firstBufferReceived) rejectFirstBuffer(error);
+        handleMicError(error);
+      },
+    });
+
+    let timeout;
+    try {
+      await Promise.race([
+        firstBuffer,
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`Microphone ${selected.name} did not produce an audio buffer within ${firstBufferTimeoutMs} ms.`)), firstBufferTimeoutMs);
+        }),
+      ]);
+    } catch (error) {
+      if (generation === micGeneration && micReading) closeCurrentMicReader();
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (generation !== micGeneration || !micReading) {
+      throw micFailure || new Error('The microphone input changed while it was opening.');
+    }
+
+    micFailure = null;
+    micAvailable = true;
+    micStatus = 'available';
+    publishMicrophoneStatus();
+    return selected;
+  };
+
+  const recoverMicrophoneInput = async () => {
+    if (micRecoveryInFlight || micRecoveryCancelled || !microphoneCaptureReady
+      || !currentCapture || currentCapture.stopping || micAvailable) return;
+    micRecoveryInFlight = true;
+    micRecoveryAttempt += 1;
+    const attempt = micRecoveryAttempt;
+    try {
+      // Devices are re-enumerated on every retry so a headset or fallback microphone
+      // that appears after the original endpoint was invalidated can be selected.
+      const settledDevice = await waitForStableMicrophoneDevice({
+        listDevices: listMicrophoneDevices,
+        preferredDeviceId: micDevice?.id || null,
+        attempts: 6,
+        requiredConsecutive: 2,
+        intervalMs: 350,
+      });
+      if (!settledDevice) throw new Error('Windows has not exposed a stable default microphone input yet.');
+      console.info(`Windows microphone endpoint settled after hot-plug: ${settledDevice.name}.`);
+      const selected = await openMicrophoneInput({ firstBufferTimeoutMs: 3000, selectedDevice: settledDevice });
+      if (!currentCapture || currentCapture.stopping || micRecoveryCancelled) {
+        closeCurrentMicReader();
+        micAvailable = false;
+        micStatus = 'unavailable';
+        return;
+      }
+      micRecoveryAttempt = 0;
+      micUnavailableNotified = false;
+      if (lastCaptureError.startsWith('Windows changed the microphone input') || lastCaptureError.startsWith('Microphone disconnected.')) lastCaptureError = '';
+      console.info(`Microphone input recovered: ${selected.name}. The existing meeting session and transcription stream were kept alive.`);
+      tray?.displayBalloon?.({ title: 'Contexa microphone reconnected', content: `${selected.name}
+Transcription continues in the current meeting session.` });
+      publishMicrophoneStatus();
+    } catch (error) {
+      if (micReading) closeCurrentMicReader();
+      micAvailable = false;
+      micStatus = 'reconnecting';
+      console.warn(`Microphone recovery attempt ${attempt} failed: ${error?.message || error}`);
+      lastCaptureError = 'Microphone disconnected. Contexa is retrying Windows input devices; the meeting session remains active.';
+      publishMicrophoneStatus();
+    } finally {
+      micRecoveryInFlight = false;
+      if (!micAvailable && currentCapture && !currentCapture.stopping) scheduleMicrophoneRecovery();
+    }
   };
 
   try {
@@ -661,10 +858,11 @@ async function startCaptureForWindow(windowInfo) {
       if (Buffer.isBuffer(chunk)) appQueue.push(stereoPcmToMono(chunk));
     });
 
-    micReader = mic({ sampleRate: PCM_RATE, channels: 1, bitDepth: 16, backend: 'miniaudio', bufferSize: 50 });
-    // @audio/mic returns one chunk per read() call, so pumpReader asks again after every chunk.
-    micPump = pumpReader(micReader, { onChunk: handleMicChunk, onError: handleMicError });
-    console.info(`Microphone reader started (backend=${micReader.backend || 'default'}, requested_rate=${PCM_RATE} Hz).`);
+    // Pin the active Windows endpoint by its current device ID. If Windows invalidates
+    // it during headset insertion/removal, recoverMicrophoneInput re-enumerates devices
+    // and opens the newly selected default input without ending the meeting session.
+    const selectedMicrophone = await openMicrophoneInput();
+    console.info(`Microphone reader started (backend=${micReader?.backend || 'miniaudio'}, requested_rate=${PCM_RATE} Hz, device=${selectedMicrophone.name}).`);
 
     // Wait for real mic buffers, not merely for the device object to be created.
     // A capture session must never silently run without the user's voice channel.
@@ -687,10 +885,25 @@ async function startCaptureForWindow(windowInfo) {
     let framesSinceAudible = Infinity;
     const emitFrame = () => {
       const frame = createStereoFrame(appQueue, micQueue);
-      const appActive = channelHasAudioActivity(frame, 0);
-      const micActive = channelHasAudioActivity(frame, 1);
+      const appLevel = measurePcm16StereoChannel(frame, 0);
+      const micLevel = measurePcm16StereoChannel(frame, 1);
+      const appActive = isPcmChannelActive(appLevel);
+      const micActive = isPcmChannelActive(micLevel);
+      audioStats.lastAppRms = appLevel.rms;
+      audioStats.lastAppPeak = appLevel.peak;
+      audioStats.maxAppRms = Math.max(audioStats.maxAppRms, appLevel.rms);
+      audioStats.maxAppPeak = Math.max(audioStats.maxAppPeak, appLevel.peak);
+      audioStats.lastMicRms = micLevel.rms;
+      audioStats.lastMicPeak = micLevel.peak;
+      audioStats.maxMicRms = Math.max(audioStats.maxMicRms, micLevel.rms);
+      audioStats.maxMicPeak = Math.max(audioStats.maxMicPeak, micLevel.peak);
       if (appActive) audioStats.appActiveFrames += 1;
       if (micActive) audioStats.micActiveFrames += 1;
+      const meterNow = Date.now();
+      if (meterNow - lastAudioMeterLogAt >= 2000) {
+        lastAudioMeterLogAt = meterNow;
+        console.info(`[${title}] Audio input meter (no audio content logged): mic_rms=${micLevel.rms} mic_peak=${micLevel.peak} mic_max_rms=${audioStats.maxMicRms} mic_max_peak=${audioStats.maxMicPeak} mic_gate_active=${micActive} app_rms=${appLevel.rms} app_peak=${appLevel.peak} app_gate_active=${appActive} mic_backlog_ms=${Math.round((micQueue.totalSamples / PCM_RATE) * 1000)}`);
+      }
       if (appActive || micActive) {
         framesSinceAudible = 0;
         audioStats.lastAudibleAt = Date.now();
@@ -737,14 +950,19 @@ async function startCaptureForWindow(windowInfo) {
       processName: windowInfo.processName,
       startedAt: Date.now(),
       lastMatchedAt: Date.now(),
+      detectionState: 'meeting-window-confirmed',
       socket,
       loopbackCapture,
       micReader,
       stopMicReader,
       mixerTimer,
       audioStats,
+      microphoneAvailable: micAvailable,
+      microphoneStatus: micStatus,
+      microphoneDevice: micDevice?.name || null,
       stopping: false,
     };
+    microphoneCaptureReady = true;
     lastCaptureError = '';
     console.info(`Automatic meeting capture started: ${title} (PID ${windowInfo.pid}); stereo channel 0=meeting audio, channel 1=local microphone; raw audio is not stored.`);
     tray?.displayBalloon?.({ title: 'Contexa is capturing a meeting', content: `${title}\nMeeting audio and your microphone are transcribed on separate channels. Raw audio is not saved.` });
@@ -840,7 +1058,18 @@ async function monitorMeetingWindows() {
   if (monitorInFlight || !settings.autoCaptureEnabled || process.platform !== 'win32') return;
   monitorInFlight = true;
   try {
-    const matches = await getMeetingWindows();
+    const desktopWindows = await getDesktopWindowSnapshot();
+    const matches = normalizeMeetingWindows(desktopWindows);
+    // Log only recognized meeting-window metadata. Ordinary window titles can contain
+    // document names or other private content and must not be copied into Contexa logs.
+    const windowSnapshot = matches
+      .map((item) => `${item.pid}:${meetingKey(item.processName, item.title)}:${item.foreground ? 'foreground' : 'background'}`)
+      .sort()
+      .join(' | ');
+    if (windowSnapshot !== lastMeetingWindowSnapshot) {
+      lastMeetingWindowSnapshot = windowSnapshot;
+      console.info(`[Meeting detector] supported meeting windows: ${windowSnapshot || '(none)'}`);
+    }
     // Do not jump to another browser/meeting window merely because the current title
     // briefly changed. Wait for the active target to be absent for the grace period.
     if (currentCapture) {
@@ -849,12 +1078,42 @@ async function monitorMeetingWindows() {
 
       if (transition.type === 'same-window') {
         currentCapture.lastMatchedAt = now;
+        if (currentCapture.detectionState === 'browser-tab-unverified') {
+          console.info(`Google Meet window became identifiable again for session ${currentCapture.meetingId}; continuing the same capture.`);
+        }
+        currentCapture.detectionState = 'meeting-window-confirmed';
       } else if (transition.type === 'same-meeting-identity-upgrade') {
         const previousKey = currentCapture.sessionKey;
-        currentCapture.sessionKey = transition.sessionKey;
-        currentCapture.title = transition.window.title || currentCapture.title;
+        const upgradedWindowTitle = transition.window.title || currentCapture.title;
+        try {
+          await upgradeMeetingIdentitySession({
+            apiBase: API_BASE,
+            meetingId: currentCapture.meetingId,
+            sessionKey: transition.sessionKey,
+            title: upgradedWindowTitle,
+            processName: transition.window.processName,
+          });
+          currentCapture.sessionKey = transition.sessionKey;
+          currentCapture.title = upgradedWindowTitle;
+          currentCapture.processName = transition.window.processName || currentCapture.processName;
+          currentCapture.lastMatchedAt = now;
+          currentCapture.detectionState = 'meeting-window-confirmed';
+          console.info(`Google Meet exposed its call ID after capture began; persisted identity upgrade on existing Contexa session ${currentCapture.meetingId}: ${previousKey} -> ${transition.sessionKey}.`);
+        } catch (error) {
+          currentCapture.lastMatchedAt = now;
+          console.error(`Could not persist Google Meet identity upgrade ${previousKey} -> ${transition.sessionKey}; the current session remains provisional and will retry:`, error?.message || error);
+        }
+      } else if (shouldKeepBrowserCaptureDuringTabSwitch(transition.type, desktopWindows, currentCapture)) {
+        // Chrome/Edge usually expose the selected tab's title, not every background tab.
+        // When the Meet title disappears but its owning browser process still has a HWND,
+        // treat this as an unverified tab/window switch instead of a meeting departure.
+        // The existing opted-in capture stream remains attached to the same browser process;
+        // the 180-second idle policy still ends a genuinely silent/ended call.
         currentCapture.lastMatchedAt = now;
-        console.info(`Google Meet exposed its call ID after capture began; continuing existing Contexa session ${currentCapture.meetingId} and upgrading identity ${previousKey} -> ${transition.sessionKey}.`);
+        if (currentCapture.detectionState !== 'browser-tab-unverified') {
+          console.info(`Meeting title temporarily unavailable, but browser process ${currentCapture.processId} is still present. Preserving Contexa session ${currentCapture.meetingId} instead of suspending it.`);
+        }
+        currentCapture.detectionState = 'browser-tab-unverified';
       } else if (transition.type === 'different-meeting') {
         const differentIdentifiedMeeting = transition.window;
         // A different explicit call ID in the same long-lived browser process is a new meeting,
@@ -913,6 +1172,9 @@ function getDesktopStatus() {
     autoCaptureEnabled: Boolean(settings.autoCaptureEnabled),
     captureActive: Boolean(currentCapture),
     meetingTitle: currentCapture?.title ?? null,
+    microphoneAvailable: currentCapture ? Boolean(currentCapture.microphoneAvailable) : false,
+    microphoneStatus: currentCapture?.microphoneStatus ?? 'unavailable',
+    microphoneDevice: currentCapture?.microphoneDevice ?? null,
     lastCaptureError: lastCaptureError || null,
   };
 }
@@ -987,7 +1249,7 @@ ipcMain.handle('contexa:pause-auto-capture', () => pauseAutoCapture());
 function updateTrayMenu() {
   if (!tray) return;
   tray.setToolTip(currentCapture
-    ? `Contexa — Recording: ${currentCapture.title}`
+    ? `Contexa — Recording: ${currentCapture.title}${currentCapture.microphoneStatus === 'available' ? '' : ' (microphone reconnecting)'}`
     : settings.autoCaptureEnabled ? 'Contexa — Watching for meetings' : 'Contexa — Auto Capture paused');
   const menu = Menu.buildFromTemplate([
     { label: currentCapture ? `Capturing: ${currentCapture.title}` : settings.autoCaptureEnabled ? 'Auto Capture is enabled' : 'Auto Capture is paused', enabled: false },

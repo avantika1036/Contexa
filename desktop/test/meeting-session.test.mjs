@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyWindowTransition, isDurableMeetingKey, meetingKey, SessionContinuity } from '../meeting-session.mjs';
+import { classifyWindowTransition, isDurableMeetingKey, meetingKey, SessionContinuity, hasSameBrowserProcessWindow, shouldKeepBrowserCaptureDuringTabSwitch } from '../meeting-session.mjs';
 
 test('a Google Meet code gives the same key regardless of tab title noise or browser', () => {
   const a = meetingKey('chrome', '(2) Meet - abc-defg-hij - Google Chrome');
@@ -163,4 +163,58 @@ test('an explicit meeting ID can resume when the user moves from Chrome to Edge'
   const current = { processId: 4242, processName: 'chrome', sessionKey: 'meet:abc-defg-hij' };
   const matches = [{ pid: 9911, processName: 'msedge', title: 'Meet - abc-defg-hij - Microsoft Edge' }];
   assert.equal(classifyWindowTransition(matches, current).type, 'same-meeting-new-process');
+});
+
+test('does not guess which of multiple background Google Meet calls belongs to a provisional window', () => {
+  const current = { processId: 4242, processName: 'chrome', sessionKey: 'browser:*' };
+  const matches = [
+    { pid: 4242, processName: 'chrome', title: 'Meet - fai-wivv-szk', foreground: false },
+    { pid: 4242, processName: 'chrome', title: 'Meet - emh-saes-zmn', foreground: false },
+  ];
+  assert.equal(classifyWindowTransition(matches, current).type, 'missing');
+});
+
+test('uses the sole foreground Google Meet call when multiple calls share one browser process', () => {
+  const current = { processId: 4242, processName: 'chrome', sessionKey: 'browser:*' };
+  const matches = [
+    { pid: 4242, processName: 'chrome', title: 'Meet - fai-wivv-szk', foreground: false },
+    { pid: 4242, processName: 'chrome', title: 'Meet - emh-saes-zmn', foreground: true },
+  ];
+  const result = classifyWindowTransition(matches, current);
+  assert.equal(result.type, 'same-meeting-identity-upgrade');
+  assert.equal(result.sessionKey, 'meet:emh-saes-zmn');
+});
+
+
+test('same Chrome process remains a continuity signal when the selected tab title changes', () => {
+  const current = { processId: 36380, processName: 'chrome', sessionKey: 'meet:fai-wivv-szk' };
+  assert.equal(hasSameBrowserProcessWindow([
+    { pid: 36380, processName: 'chrome', title: 'Google Docs', foreground: true },
+  ], current), true);
+});
+
+test('a different browser process does not keep the old meeting alive', () => {
+  const current = { processId: 36380, processName: 'chrome', sessionKey: 'meet:fai-wivv-szk' };
+  assert.equal(hasSameBrowserProcessWindow([
+    { pid: 9911, processName: 'chrome', title: 'New Tab', foreground: true },
+  ], current), false);
+});
+
+test('a native application process is not treated as a browser-tab continuity signal', () => {
+  const current = { processId: 36380, processName: 'zoom', sessionKey: 'zoom:*' };
+  assert.equal(hasSameBrowserProcessWindow([
+    { pid: 36380, processName: 'zoom', title: 'Zoom Workplace', foreground: true },
+  ], current), false);
+});
+
+
+test('the browser continuity fallback applies only to an unverified/missing transition', () => {
+  const current = { processId: 36380, processName: 'chrome', sessionKey: 'meet:fai-wivv-szk' };
+  const sameProcessOtherTab = [
+    { pid: 36380, processName: 'chrome', title: 'Calendar', foreground: true },
+  ];
+  assert.equal(shouldKeepBrowserCaptureDuringTabSwitch('missing', sameProcessOtherTab, current), true);
+  assert.equal(shouldKeepBrowserCaptureDuringTabSwitch('different-meeting', sameProcessOtherTab, current), false);
+  assert.equal(shouldKeepBrowserCaptureDuringTabSwitch('same-window', sameProcessOtherTab, current), false);
+  assert.equal(shouldKeepBrowserCaptureDuringTabSwitch('missing', [], current), false);
 });

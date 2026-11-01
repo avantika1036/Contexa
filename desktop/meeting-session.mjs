@@ -15,6 +15,30 @@ function familyOf(processName) {
   return 'browser';
 }
 
+/**
+ * True when the browser process that originally owned a stable meeting window still
+ * owns a top-level window, even if that HWND now displays another tab's title.
+ * This is a continuity signal only; it is never used to identify or merge meetings.
+ */
+export function hasSameBrowserProcessWindow(windows, current) {
+  if (!current || familyOf(current.processName) !== 'browser' || !Number.isInteger(Number(current.processId))) {
+    return false;
+  }
+  return (Array.isArray(windows) ? windows : []).some((windowInfo) =>
+    Number(windowInfo?.pid) === Number(current.processId)
+      && familyOf(windowInfo?.processName) === 'browser'
+  );
+}
+
+/**
+ * Keep a browser capture alive only when the meeting identity is currently unmatchable
+ * but the exact browser process that owned it still has a top-level window. An explicit
+ * different meeting transition must never be swallowed by this fallback.
+ */
+export function shouldKeepBrowserCaptureDuringTabSwitch(transitionType, windows, current) {
+  return transitionType === 'missing' && hasSameBrowserProcessWindow(windows, current);
+}
+
 function normalizeTitle(title) {
   return String(title || '')
     .replace(/^auto\s*·\s*/i, '')
@@ -71,9 +95,16 @@ export function classifyWindowTransition(matches, current) {
   // Google Meet can initially expose only a generic browser title ("Google Meet"),
   // then expose the actual call code once the meeting surface finishes loading.
   // In the same browser process this is an identity upgrade, not a missing window.
+  const chooseUnambiguousWindow = (candidates) => {
+    if (candidates.length === 1) return candidates[0];
+    const foreground = candidates.filter((windowInfo) => windowInfo.foreground);
+    return foreground.length === 1 ? foreground[0] : null;
+  };
+
   if (current.sessionKey === 'browser:*' && familyOf(current.processName) === 'browser') {
-    const identifiedMeet = matches.find((windowInfo) => sameProcess(windowInfo)
+    const identifiedMeets = matches.filter((windowInfo) => sameProcess(windowInfo)
       && /^meet:[a-z]{3}-[a-z]{4}-[a-z]{3}$/i.test(keyOf(windowInfo)));
+    const identifiedMeet = chooseUnambiguousWindow(identifiedMeets);
     if (identifiedMeet) {
       return {
         type: 'same-meeting-identity-upgrade',
@@ -83,18 +114,20 @@ export function classifyWindowTransition(matches, current) {
     }
   }
 
-  const sameMeetingNewProcess = isDurableMeetingKey(current.sessionKey)
-    ? matches.find((windowInfo) => keyOf(windowInfo) === current.sessionKey && windowInfo.pid !== current.processId)
-    : null;
+  const sameMeetingCandidates = isDurableMeetingKey(current.sessionKey)
+    ? matches.filter((windowInfo) => keyOf(windowInfo) === current.sessionKey && windowInfo.pid !== current.processId)
+    : [];
+  const sameMeetingNewProcess = chooseUnambiguousWindow(sameMeetingCandidates);
   if (sameMeetingNewProcess) return { type: 'same-meeting-new-process', window: sameMeetingNewProcess };
 
-  const differentMeeting = matches.find((windowInfo) => {
+  const differentMeetings = matches.filter((windowInfo) => {
     if (!sameProcess(windowInfo)) return false;
     const nextKey = keyOf(windowInfo);
     return nextKey !== current.sessionKey
       && isDurableMeetingKey(nextKey)
       && isDurableMeetingKey(current.sessionKey);
   });
+  const differentMeeting = chooseUnambiguousWindow(differentMeetings);
   if (differentMeeting) return { type: 'different-meeting', window: differentMeeting };
 
   return { type: 'missing', window: null };
