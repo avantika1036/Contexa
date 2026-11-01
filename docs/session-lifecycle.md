@@ -137,3 +137,12 @@ Quit or shutting down through the desktop's graceful exit path flushes and suspe
 session rather than ending a meeting that may still be running. A hard process kill cannot flush
 audio, but a still-active stable-key row can be recovered through the idempotent auto-session
 endpoint on the next launch.
+
+
+## Shutdown suspension and audio-stream fencing
+
+The backend distinguishes live WebSocket connections from active upstream audio/transcription streams. UI/control WebSockets may remain connected briefly after `audio.stop` while the ASGI disconnect cleanup is still running. They must not block suspension once the upstream Deepgram stream has been finalized.
+
+`ACTIVE_MEETING_STREAMS` is incremented only after an upstream transcription stream is established and decremented after finalization and provider close complete. The backend sends the `audio.stop` acknowledgement after that decrement. The suspend endpoint rejects only while this stream count is non-zero; the WebSocket connection count remains in place for cleanup and deletion protection.
+
+This ordering makes Electron's shutdown sequence deterministic: stop microphone and loopback readers, flush/finalize the transcription stream, receive the `audio.stop` acknowledgement, close the WebSocket, then persist the meeting as `suspended`. No database migration is required for this correction.
