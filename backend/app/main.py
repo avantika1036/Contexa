@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from urllib.parse import urlencode
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ from app.database import engine, get_db, get_session_factory
 from app.models import Meeting, MemoryItem, TranscriptSegment
 from app.schemas import (
     MeetingCreate, MeetingRead, MemoryExtractionResponse, MemoryItemRead, TranscriptSegmentRead,
-    MeetingQuestionRequest, MeetingQuestionResponse, AutoMeetingCreate, AutoMeetingResponse,
+    MeetingQuestionRequest, MeetingQuestionResponse, AutoMeetingCreate, AutoMeetingResponse, MeetingIdentityUpgrade,
 )
 from app.memory_service import process_meeting_transcript_memory
 from app.qa_service import answer_meeting_question as generate_meeting_answer
@@ -33,6 +34,22 @@ MAX_AUDIO_CHUNK_BYTES = 2_000_000
 MEMORY_EXTRACTION_JOBS: dict[str, dict[str, object]] = {}
 # Number of live WebSocket connections per meeting; cleanup never touches a connected meeting.
 ACTIVE_MEETING_CONNECTIONS: dict[str, int] = {}
+# Number of active upstream audio/transcription streams per meeting. A WebSocket can
+# remain open for UI/control traffic after audio.stop, so suspension must guard this
+# counter rather than ACTIVE_MEETING_CONNECTIONS.
+ACTIVE_MEETING_STREAMS: dict[str, int] = {}
+
+
+def _mark_audio_stream_started(meeting_id: str) -> None:
+    ACTIVE_MEETING_STREAMS[meeting_id] = ACTIVE_MEETING_STREAMS.get(meeting_id, 0) + 1
+
+
+def _mark_audio_stream_stopped(meeting_id: str) -> None:
+    remaining = ACTIVE_MEETING_STREAMS.get(meeting_id, 1) - 1
+    if remaining > 0:
+        ACTIVE_MEETING_STREAMS[meeting_id] = remaining
+    else:
+        ACTIVE_MEETING_STREAMS.pop(meeting_id, None)
 
 
 class AudioTimeline:
@@ -181,6 +198,121 @@ def _delete_meeting_records(db: Session, meeting_id: str) -> None:
     MEMORY_EXTRACTION_JOBS.pop(meeting_id, None)
 
 
+def _legacy_auto_meet_candidates(db: Session) -> list[Meeting]:
+    """Find recent pre-identity automatic Google Meet rows created by older desktop builds."""
+    rows = list(db.scalars(
+        select(Meeting)
+        .where(
+            Meeting.capture_key.is_(None),
+            Meeting.status.in_(["active", "suspended"]),
+            Meeting.title.in_(["Auto · Meet", "Auto · Google Meet"]),
+        )
+        .order_by(Meeting.created_at.desc())
+        .limit(3)
+    ).all())
+
+    grace_seconds = max(0, int(settings.suspended_session_resume_grace_seconds))
+    now = datetime.now(timezone.utc)
+    candidates: list[Meeting] = []
+    for row in rows:
+        if ACTIVE_MEETING_CONNECTIONS.get(row.id, 0) > 0:
+            continue
+        latest_segment = db.scalar(
+            select(func.max(TranscriptSegment.created_at)).where(TranscriptSegment.meeting_id == row.id)
+        )
+        last_activity = _aware(row.suspended_at or row.created_at)
+        if latest_segment is not None:
+            last_activity = max(last_activity, _aware(latest_segment))
+        age_seconds = max(0.0, (now - last_activity).total_seconds())
+        if age_seconds <= grace_seconds:
+            candidates.append(row)
+    return candidates
+
+
+def _shift_transcript_segment(segment: TranscriptSegment, offset_seconds: float) -> None:
+    segment.start_seconds = float(segment.start_seconds) + offset_seconds
+    segment.end_seconds = float(segment.end_seconds) + offset_seconds
+    if isinstance(segment.words, list):
+        shifted_words = []
+        for word in segment.words:
+            if not isinstance(word, dict):
+                shifted_words.append(word)
+                continue
+            shifted = dict(word)
+            for key in ("start", "end", "start_seconds", "end_seconds"):
+                value = shifted.get(key)
+                if isinstance(value, (int, float)):
+                    shifted[key] = float(value) + offset_seconds
+            shifted_words.append(shifted)
+        segment.words = shifted_words
+
+
+def _merge_legacy_auto_meet_into(legacy: Meeting, canonical: Meeting, db: Session) -> None:
+    """Merge one old provisional Google Meet row into its stable-ID row before a new stream opens.
+
+    The stable row is canonical. Transcript timestamps are shifted only when the rows overlap
+    in separate stream-relative timelines; the earlier row remains first in the combined history.
+    This function is called only when neither row has an active WebSocket connection.
+    """
+    if legacy.id == canonical.id:
+        return
+
+    legacy_segments = list(db.scalars(
+        select(TranscriptSegment).where(TranscriptSegment.meeting_id == legacy.id)
+    ).all())
+    canonical_segments = list(db.scalars(
+        select(TranscriptSegment).where(TranscriptSegment.meeting_id == canonical.id)
+    ).all())
+
+    legacy_first_segment_at = min((_aware(item.created_at) for item in legacy_segments), default=_aware(legacy.created_at))
+    canonical_first_segment_at = min((_aware(item.created_at) for item in canonical_segments), default=_aware(canonical.created_at))
+    legacy_is_earlier = legacy_first_segment_at <= canonical_first_segment_at
+    legacy_max_end = max((float(item.end_seconds) for item in legacy_segments), default=0.0)
+    canonical_max_end = max((float(item.end_seconds) for item in canonical_segments), default=0.0)
+
+    legacy_offset = 0.0
+    canonical_offset = 0.0
+    if legacy_segments and canonical_segments:
+        if legacy_is_earlier:
+            canonical_offset = legacy_max_end
+            for segment in canonical_segments:
+                _shift_transcript_segment(segment, canonical_offset)
+        else:
+            legacy_offset = canonical_max_end
+            for segment in legacy_segments:
+                _shift_transcript_segment(segment, legacy_offset)
+    elif not legacy_is_earlier and canonical_max_end > 0:
+        legacy_offset = canonical_max_end
+        for segment in legacy_segments:
+            _shift_transcript_segment(segment, legacy_offset)
+
+    for segment in legacy_segments:
+        segment.meeting_id = canonical.id
+
+    legacy_items = list(db.scalars(select(MemoryItem).where(MemoryItem.meeting_id == legacy.id)).all())
+    canonical_items = list(db.scalars(select(MemoryItem).where(MemoryItem.meeting_id == canonical.id)).all())
+    for item in canonical_items:
+        if canonical_offset:
+            item.start_seconds = float(item.start_seconds) + canonical_offset
+            item.end_seconds = float(item.end_seconds) + canonical_offset
+    canonical_keys = {(item.item_type, item.dedupe_key) for item in canonical_items}
+    for item in legacy_items:
+        if legacy_offset:
+            item.start_seconds = float(item.start_seconds) + legacy_offset
+            item.end_seconds = float(item.end_seconds) + legacy_offset
+        if (item.item_type, item.dedupe_key) in canonical_keys:
+            item.dedupe_key = f"{item.dedupe_key}:merged:{legacy.id[:8]}"[:255]
+        item.meeting_id = canonical.id
+
+    canonical.created_at = min(_aware(canonical.created_at), _aware(legacy.created_at))
+    canonical.title = canonical.title or legacy.title
+    db.delete(legacy)
+    logger.info(
+        "Merged legacy provisional Meet session %s into stable session %s (transcript_segments=%d memory_items=%d)",
+        legacy.id, canonical.id, len(legacy_segments), len(legacy_items),
+    )
+
+
 def _finish_active_meeting(
     meeting: Meeting,
     db: Session,
@@ -205,7 +337,8 @@ def _finish_active_meeting(
 
 @app.post("/api/meetings", response_model=MeetingRead, status_code=201, tags=["meetings"])
 def create_meeting(payload: MeetingCreate, db: Session = Depends(get_db)) -> Meeting:
-    meeting = Meeting(title=payload.title)
+    is_automatic = payload.title.strip().lower().startswith("auto · ")
+    meeting = Meeting(title=payload.title, audio_source=("desktop_auto" if is_automatic else None))
     db.add(meeting)
     db.commit()
     db.refresh(meeting)
@@ -237,6 +370,21 @@ def create_or_reuse_auto_meeting(
         )
     )
     if existing is not None:
+        # Older desktop builds created "Auto · Meet" before Google exposed its call code,
+        # then upgraded only an in-memory key. Reconcile the single recent unkeyed row here
+        # before opening a new WebSocket so restart recovery does not create another history item.
+        legacy_candidates = [row for row in _legacy_auto_meet_candidates(db) if row.id != existing.id]
+        if len(legacy_candidates) == 1 and ACTIVE_MEETING_CONNECTIONS.get(existing.id, 0) == 0:
+            _merge_legacy_auto_meet_into(legacy_candidates[0], existing, db)
+        elif legacy_candidates:
+            # Empty legacy rows are safe to discard; rows with transcripts are deliberately
+            # preserved when the identity is ambiguous rather than risking a wrong merge.
+            for legacy in legacy_candidates:
+                if _segment_count(db, legacy.id) == 0 and db.scalar(
+                    select(func.count()).select_from(MemoryItem).where(MemoryItem.meeting_id == legacy.id)
+                ) == 0:
+                    _delete_meeting_records(db, legacy.id)
+                    logger.info("Discarded empty legacy provisional Meet session %s", legacy.id)
         if existing.status == "suspended":
             suspended_at = _aware(existing.suspended_at or existing.created_at)
             age_seconds = max(0.0, (datetime.now(timezone.utc) - suspended_at).total_seconds())
@@ -267,6 +415,29 @@ def create_or_reuse_auto_meeting(
             db.commit()
             db.refresh(existing)
             return {"meeting": existing, "reused": True}
+
+    # No stable row exists. If exactly one recent legacy provisional Auto · Meet row exists,
+    # upgrade it in place instead of creating a duplicate session after an Electron restart.
+    legacy_candidates = _legacy_auto_meet_candidates(db)
+    if len(legacy_candidates) == 1:
+        legacy = legacy_candidates[0]
+        legacy.capture_key = payload.capture_key
+        legacy.title = payload.title[:200]
+        legacy.capture_process_name = (payload.process_name or None)
+        legacy.audio_source = "desktop_auto"
+        if legacy.status == "suspended":
+            legacy.status = "active"
+            legacy.suspended_at = None
+            legacy.ended_at = None
+        try:
+            db.commit()
+            db.refresh(legacy)
+            logger.info("Adopted legacy provisional Meet session %s for stable capture key %s", legacy.id, payload.capture_key)
+            return {"meeting": legacy, "reused": True}
+        except IntegrityError:
+            db.rollback()
+            logger.exception("Could not adopt legacy provisional Meet session for %s", payload.capture_key)
+            raise HTTPException(status_code=409, detail="Could not safely adopt the previous provisional meeting session.")
 
     meeting = Meeting(
         title=payload.title,
@@ -301,6 +472,49 @@ def create_or_reuse_auto_meeting(
         return {"meeting": existing, "reused": True}
 
 
+@app.patch("/api/meetings/{meeting_id}/identity", response_model=MeetingRead, tags=["meetings"])
+def upgrade_meeting_identity(
+    meeting_id: str,
+    payload: MeetingIdentityUpgrade,
+    db: Session = Depends(get_db),
+) -> Meeting:
+    """Persist a provider call ID discovered after an automatic capture has already started."""
+    if not re.fullmatch(r"(?:meet:[a-z]{3}-[a-z]{4}-[a-z]{3}|(?:zoom|teams|webex):id:\d{8,13})", payload.capture_key, re.IGNORECASE):
+        raise HTTPException(status_code=422, detail="Only a stable provider meeting identity can be persisted.")
+
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None:
+        raise HTTPException(status_code=404, detail="Meeting session not found.")
+    if meeting.status == "ended":
+        raise HTTPException(status_code=409, detail="An ended meeting cannot receive a new capture identity.")
+
+    existing = db.scalar(
+        select(Meeting).where(
+            Meeting.capture_key == payload.capture_key,
+            Meeting.status.in_(["active", "suspended"]),
+            Meeting.id != meeting_id,
+        )
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Another open session already owns this meeting identity ({existing.id}). Retry using the stable automatic-session endpoint.",
+        )
+
+    meeting.capture_key = payload.capture_key
+    meeting.title = payload.title[:200]
+    meeting.capture_process_name = (payload.process_name or None)
+    meeting.audio_source = "desktop_auto"
+    try:
+        db.commit()
+        db.refresh(meeting)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="This meeting identity was claimed by another capture at the same time.") from exc
+    logger.info("Persisted stable capture identity %s on existing session %s", payload.capture_key, meeting.id)
+    return meeting
+
+
 @app.post("/api/meetings/{meeting_id}/suspend", response_model=MeetingRead, tags=["meetings"])
 def suspend_meeting(meeting_id: str, db: Session = Depends(get_db)) -> Meeting:
     """Persist a recoverable capture interruption without declaring the meeting ended."""
@@ -310,8 +524,12 @@ def suspend_meeting(meeting_id: str, db: Session = Depends(get_db)) -> Meeting:
     if meeting.status == "ended":
         raise HTTPException(status_code=409, detail="This meeting session has ended and cannot be suspended.")
     if meeting.status == "active":
-        if ACTIVE_MEETING_CONNECTIONS.get(meeting_id, 0) > 0:
-            raise HTTPException(status_code=409, detail="Stop the active capture stream before suspending this meeting.")
+        # A websocket may remain connected for UI/control traffic after its audio
+        # stream has been finalized. Only an active upstream transcription stream
+        # should prevent suspension. The audio.stop acknowledgement is sent only
+        # after this counter is decremented, avoiding a shutdown race.
+        if ACTIVE_MEETING_STREAMS.get(meeting_id, 0) > 0:
+            raise HTTPException(status_code=409, detail="Stop the active audio stream before suspending this meeting.")
         meeting.status = "suspended"
         meeting.suspended_at = datetime.now(timezone.utc)
         meeting.ended_at = None
@@ -483,14 +701,19 @@ def cleanup_meetings(
         latest_segment = db.scalar(
             select(func.max(TranscriptSegment.created_at)).where(TranscriptSegment.meeting_id == meeting.id)
         )
-        if meeting.status == "suspended" and meeting.suspended_at is not None:
-            last_activity = _aware(meeting.suspended_at)
-            if latest_segment is not None:
-                last_activity = max(last_activity, _aware(latest_segment))
+        if meeting.status == "suspended":
+            # Suspension is persisted only after the audio stream has been stopped and
+            # its final transcript segments flushed, so suspended_at is the recovery clock.
+            last_activity = _aware(meeting.suspended_at or meeting.created_at)
+            # Suspended sessions have their own short, persisted recovery window. Do not
+            # leave them yellow for the much longer generic stale-active-session timeout.
+            recovery_grace_seconds = max(0, int(settings.suspended_session_resume_grace_seconds))
+            if (now - last_activity).total_seconds() < recovery_grace_seconds:
+                continue
         else:
             last_activity = _aware(latest_segment or meeting.created_at)
-        if (now - last_activity).total_seconds() < threshold_minutes * 60:
-            continue
+            if (now - last_activity).total_seconds() < threshold_minutes * 60:
+                continue
         if _segment_count(db, meeting.id) == 0:
             _delete_meeting_records(db, meeting.id)
             counts["discarded"] += 1
@@ -1010,6 +1233,7 @@ async def meeting_websocket(
     logger.info("WebSocket connected: meeting_id=%s title=%r", meeting_id, meeting_title)
 
     upstream: ClientConnection | None = None
+    stream_counted = False
     transcription_task: asyncio.Task[None] | None = None
     keepalive_task: asyncio.Task[None] | None = None
     upstream_send_lock = asyncio.Lock()
@@ -1025,38 +1249,48 @@ async def meeting_websocket(
                 await websocket.send_json(payload)
 
     async def finish_transcription_stream() -> None:
-        nonlocal upstream, transcription_task, keepalive_task
+        nonlocal upstream, stream_counted, transcription_task, keepalive_task
         current_upstream = upstream
         current_task = transcription_task
         current_keepalive = keepalive_task
+        current_stream_counted = stream_counted
         upstream = None
+        stream_counted = False
         transcription_task = None
         keepalive_task = None
-        if current_keepalive is not None:
-            current_keepalive.cancel()
-            try:
-                await current_keepalive
-            except asyncio.CancelledError:
-                pass
-        if current_upstream is not None:
-            try:
-                async with upstream_send_lock:
-                    await current_upstream.send(json.dumps({"type": "Finalize"}))
-                    await current_upstream.send(json.dumps({"type": "CloseStream"}))
-            except Exception:
-                logger.info("Could not gracefully finalize Deepgram stream for %s", meeting_id)
-            try:
-                if current_task is not None:
-                    await asyncio.wait_for(current_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                if current_task is not None:
-                    current_task.cancel()
-            except Exception:
-                logger.exception("Error finalizing transcription task for %s", meeting_id)
-            try:
-                await current_upstream.close()
-            except Exception:
-                pass
+        try:
+            if current_keepalive is not None:
+                current_keepalive.cancel()
+                try:
+                    await current_keepalive
+                except asyncio.CancelledError:
+                    pass
+            if current_upstream is not None:
+                try:
+                    async with upstream_send_lock:
+                        await current_upstream.send(json.dumps({"type": "Finalize"}))
+                        await current_upstream.send(json.dumps({"type": "CloseStream"}))
+                except Exception:
+                    logger.info("Could not gracefully finalize Deepgram stream for %s", meeting_id)
+                try:
+                    if current_task is not None:
+                        await asyncio.wait_for(current_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    if current_task is not None:
+                        current_task.cancel()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Error finalizing transcription task for %s", meeting_id)
+                try:
+                    await current_upstream.close()
+                except Exception:
+                    pass
+        finally:
+            # Keep the stream marked active until Deepgram finalization/close has
+            # completed. audio.stop is acknowledged only after this decrement.
+            if current_stream_counted:
+                _mark_audio_stream_stopped(meeting_id)
 
     ACTIVE_MEETING_CONNECTIONS[meeting_id] = ACTIVE_MEETING_CONNECTIONS.get(meeting_id, 0) + 1
     try:
@@ -1237,6 +1471,8 @@ async def meeting_websocket(
                             audio_timeline,
                         )
                     )
+                    _mark_audio_stream_started(meeting_id)
+                    stream_counted = True
                     keepalive_task = asyncio.create_task(
                         _keep_deepgram_alive(upstream, upstream_send_lock, meeting_id)
                     )

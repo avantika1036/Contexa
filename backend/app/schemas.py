@@ -50,6 +50,28 @@ class AutoMeetingCreate(BaseModel):
         return cleaned
 
 
+class MeetingIdentityUpgrade(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    capture_key: str = Field(min_length=1, max_length=255)
+    process_name: str | None = Field(default=None, max_length=100)
+
+    @field_validator("title")
+    @classmethod
+    def identity_title_must_not_be_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Meeting title cannot be blank.")
+        return cleaned
+
+    @field_validator("capture_key")
+    @classmethod
+    def identity_key_must_not_be_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Capture identity cannot be blank.")
+        return cleaned
+
+
 class AutoMeetingResponse(BaseModel):
     meeting: MeetingRead
     reused: bool

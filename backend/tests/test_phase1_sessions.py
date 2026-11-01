@@ -370,16 +370,174 @@ def test_cleanup_expires_stale_suspended_sessions(client):
     assert client.get(f"/api/meetings/{empty['id']}").status_code == 404
 
 
-def test_cannot_suspend_while_meeting_websocket_is_connected(client, monkeypatch):
+def test_idle_meeting_websocket_does_not_block_suspension(client):
+    from app import main as main_module
+
+    meeting = create_session(client, "connected idle meeting websocket")
+    with client.websocket_connect(f"/ws/meeting/{meeting['id']}") as websocket:
+        websocket.receive_json()
+        # A connected UI/control websocket is not an active audio capture stream.
+        response = client.post(f"/api/meetings/{meeting['id']}/suspend")
+        assert response.status_code == 200
+        assert response.json()["status"] == "suspended"
+        assert main_module.ACTIVE_MEETING_CONNECTIONS.get(meeting["id"]) == 1
+        assert main_module.ACTIVE_MEETING_STREAMS.get(meeting["id"], 0) == 0
+
+
+def test_suspension_waits_for_audio_stream_stop_not_websocket_disconnect(client, monkeypatch):
+    """A control WebSocket may stay open after audio.stop; that must not block suspend."""
     from app import main as main_module
 
     async def fake_connect(*args, **kwargs):
         return FakeDeepgramConnection()
 
+    monkeypatch.setattr(main_module.settings, "deepgram_api_key", "test-key")
     monkeypatch.setattr(main_module, "upstream_connect", fake_connect)
-    meeting = create_session(client, "connected live meeting")
+    meeting = create_session(client, "shutdown suspension")
+
     with client.websocket_connect(f"/ws/meeting/{meeting['id']}") as websocket:
-        websocket.receive_json()
-        response = client.post(f"/api/meetings/{meeting['id']}/suspend")
-        assert response.status_code == 409
-        assert client.get(f"/api/meetings/{meeting['id']}").json()["status"] == "active"
+        websocket.receive_json()  # connection.established
+        websocket.send_json({"type": "audio.start", "source": "desktop_auto"})
+        assert websocket.receive_json()["type"] == "transcription.ready"
+        assert websocket.receive_json()["message_type"] == "audio.start"
+
+        assert main_module.ACTIVE_MEETING_CONNECTIONS.get(meeting["id"]) == 1
+        assert main_module.ACTIVE_MEETING_STREAMS.get(meeting["id"]) == 1
+        blocked = client.post(f"/api/meetings/{meeting['id']}/suspend")
+        assert blocked.status_code == 409
+
+        websocket.send_json({"type": "audio.stop", "source": "desktop_auto"})
+        stopped = websocket.receive_json()
+        assert stopped["type"] == "message.received"
+        assert stopped["message_type"] == "audio.stop"
+
+        # The websocket itself is still open, but the provider stream has been
+        # finalized and the server has acknowledged audio.stop. Suspension is safe.
+        assert main_module.ACTIVE_MEETING_CONNECTIONS.get(meeting["id"]) == 1
+        assert main_module.ACTIVE_MEETING_STREAMS.get(meeting["id"], 0) == 0
+        suspended = client.post(f"/api/meetings/{meeting['id']}/suspend")
+        assert suspended.status_code == 200, suspended.text
+        assert suspended.json()["status"] == "suspended"
+
+    assert main_module.ACTIVE_MEETING_CONNECTIONS.get(meeting["id"], 0) == 0
+    assert main_module.ACTIVE_MEETING_STREAMS.get(meeting["id"], 0) == 0
+
+
+def test_identity_upgrade_persists_the_google_meet_key_on_the_original_session(client):
+    provisional = create_session(client, "Auto · Meet")
+    upgraded = client.patch(
+        f"/api/meetings/{provisional['id']}/identity",
+        json={
+            "title": "Auto · Meet - fai-wivv-szk",
+            "capture_key": "meet:fai-wivv-szk",
+            "process_name": "chrome",
+        },
+    )
+    assert upgraded.status_code == 200, upgraded.text
+    assert upgraded.json()["id"] == provisional["id"]
+    assert upgraded.json()["title"] == "Auto · Meet - fai-wivv-szk"
+    with _factory()() as session:
+        stored = session.get(Meeting, provisional["id"])
+        assert stored.capture_key == "meet:fai-wivv-szk"
+        assert stored.capture_process_name == "chrome"
+        assert stored.audio_source == "desktop_auto"
+
+    reused = client.post("/api/meetings/auto", json={
+        "title": "Auto · Meet - fai-wivv-szk",
+        "capture_key": "meet:fai-wivv-szk",
+        "process_name": "chrome",
+    })
+    assert reused.status_code == 200
+    assert reused.json()["reused"] is True
+    assert reused.json()["meeting"]["id"] == provisional["id"]
+
+
+def test_auto_endpoint_adopts_a_recent_legacy_provisional_meet_after_restart(client):
+    provisional = create_session(client, "Auto · Meet")
+    add_segment(provisional["id"], text="Speech before Contexa restarted.", start=1.0, end=2.0)
+    suspended = client.post(f"/api/meetings/{provisional['id']}/suspend")
+    assert suspended.status_code == 200
+
+    recovered = client.post("/api/meetings/auto", json={
+        "title": "Auto · Meet - fai-wivv-szk",
+        "capture_key": "meet:fai-wivv-szk",
+        "process_name": "chrome",
+    })
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["reused"] is True
+    assert recovered.json()["meeting"]["id"] == provisional["id"]
+    assert recovered.json()["meeting"]["title"] == "Auto · Meet - fai-wivv-szk"
+    assert recovered.json()["meeting"]["status"] == "active"
+    with _factory()() as session:
+        stored = session.get(Meeting, provisional["id"])
+        assert stored.capture_key == "meet:fai-wivv-szk"
+        assert session.query(TranscriptSegment).filter(TranscriptSegment.meeting_id == provisional["id"]).count() == 1
+    assert len(client.get("/api/meetings").json()) == 1
+
+
+def test_auto_endpoint_merges_one_legacy_transcript_into_existing_stable_session(client):
+    payload = {
+        "title": "Auto · Meet - fai-wivv-szk",
+        "capture_key": "meet:fai-wivv-szk",
+        "process_name": "chrome",
+    }
+    stable = client.post("/api/meetings/auto", json=payload).json()["meeting"]
+    add_segment(stable["id"], text="Earlier stable-session transcript.", start=1.0, end=2.0)
+
+    legacy = create_session(client, "Auto · Meet")
+    add_segment(legacy["id"], text="Later provisional transcript.", start=1.0, end=2.0)
+    assert client.post(f"/api/meetings/{legacy['id']}/suspend").status_code == 200
+
+    recovered = client.post("/api/meetings/auto", json=payload)
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["meeting"]["id"] == stable["id"]
+    transcript = client.get(f"/api/meetings/{stable['id']}/transcript").json()
+    assert [item["text"] for item in transcript] == [
+        "Earlier stable-session transcript.",
+        "Later provisional transcript.",
+    ]
+    assert transcript[0]["start_seconds"] == 1.0
+    assert transcript[1]["start_seconds"] >= 3.0
+    assert client.get(f"/api/meetings/{legacy['id']}").status_code == 404
+    assert len(client.get("/api/meetings").json()) == 1
+
+
+def test_identity_upgrade_rejects_a_second_open_owner_for_the_same_call_key(client):
+    first = client.post("/api/meetings/auto", json={
+        "title": "Auto · Meet - fai-wivv-szk",
+        "capture_key": "meet:fai-wivv-szk",
+        "process_name": "chrome",
+    }).json()["meeting"]
+    second = create_session(client, "Auto · Meet")
+    conflict = client.patch(
+        f"/api/meetings/{second['id']}/identity",
+        json={
+            "title": "Auto · Meet - fai-wivv-szk",
+            "capture_key": "meet:fai-wivv-szk",
+            "process_name": "chrome",
+        },
+    )
+    assert conflict.status_code == 409
+    assert client.get(f"/api/meetings/{first['id']}").status_code == 200
+    assert client.get(f"/api/meetings/{second['id']}").status_code == 200
+
+
+def test_cleanup_uses_five_minute_recovery_window_for_suspended_rows(client, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "suspended_session_resume_grace_seconds", 300)
+    meeting = client.post("/api/meetings/auto", json={
+        "title": "Auto · Meet - expired-call",
+        "capture_key": "meet:abc-defg-hij",
+        "process_name": "chrome",
+    }).json()["meeting"]
+    add_segment(meeting["id"], text="Transcript must be retained after expiration.")
+    assert client.post(f"/api/meetings/{meeting['id']}/suspend").status_code == 200
+    with _factory()() as session:
+        row = session.get(Meeting, meeting["id"])
+        row.suspended_at = datetime.now(timezone.utc) - timedelta(minutes=6)
+        session.commit()
+
+    counts = client.post("/api/meetings/cleanup").json()
+    assert counts["ended"] == 1
+    assert client.get(f"/api/meetings/{meeting['id']}").json()["status"] == "ended"
