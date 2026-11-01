@@ -690,11 +690,17 @@ function App() {
     const nextMeeting = meetings.find((meeting) => meeting.id === nextId) ?? null;
     setShowCreateForm(false);
     setSessionMessage("");
+    setActiveTab("transcript");
+
+    // Clicking the already-selected history row must not clear its transcript.
+    // Because the ID is unchanged, React will not rerun the transcript-loading effect;
+    // clearing the array here made the transcript appear to alternate with an empty view.
+    if (nextId === selectedMeetingId) return;
+
     setTranscriptSegments([]);
     setInterimTranscript(null);
     setSelectedMeetingId(nextId);
     setConsentConfirmed(false);
-    setActiveTab("transcript");
     setConnection(nextMeeting?.status === "active" ? "connecting" : "disconnected");
     setConnectionMessage(
       nextMeeting?.status === "active"
