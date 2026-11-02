@@ -71,6 +71,7 @@ const continuity = new SessionContinuity({ graceMs: SESSION_GRACE_MS });
 let finalizeTimer = null;
 let restartBlock = null;
 let lastMeetingWindowSnapshot = '';
+let lastMonitorError = '';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1060,6 +1061,7 @@ async function monitorMeetingWindows() {
   try {
     const desktopWindows = await getDesktopWindowSnapshot();
     const matches = normalizeMeetingWindows(desktopWindows);
+    lastMonitorError = '';
     // Log only recognized meeting-window metadata. Ordinary window titles can contain
     // document names or other private content and must not be copied into Contexa logs.
     const windowSnapshot = matches
@@ -1159,6 +1161,12 @@ async function monitorMeetingWindows() {
         if (await ensureLocalServices()) await startCaptureForWindow(match);
         else console.warn('Automatic capture paused: local Contexa services are not available yet.');
       }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message !== lastMonitorError) {
+      console.error('[Meeting detector] monitoring cycle failed:', message);
+      lastMonitorError = message;
     }
   } finally {
     monitorInFlight = false;

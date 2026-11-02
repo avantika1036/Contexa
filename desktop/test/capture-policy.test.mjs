@@ -111,6 +111,7 @@ test('normalizes all top-level browser windows instead of relying on one process
   assert.deepEqual(windows[0], {
     pid: 36380,
     processName: 'chrome',
+    windowId: null,
     title: 'Meet - fai-wivv-szk',
     foreground: false,
   });

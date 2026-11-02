@@ -107,6 +107,7 @@ export function normalizeDesktopWindows(rawWindows) {
     .map((window) => ({
       pid: Number(window.pid),
       processName: String(window.processName),
+      windowId: window.windowId ? String(window.windowId) : null,
       title: String(window.title || '')
         .replace(/\s+-\s+(Google Chrome|Microsoft Edge|Mozilla Firefox|Brave)$/i, '')
         .trim()
