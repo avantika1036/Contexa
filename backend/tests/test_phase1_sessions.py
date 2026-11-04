@@ -541,3 +541,119 @@ def test_cleanup_uses_five_minute_recovery_window_for_suspended_rows(client, mon
     counts = client.post("/api/meetings/cleanup").json()
     assert counts["ended"] == 1
     assert client.get(f"/api/meetings/{meeting['id']}").json()["status"] == "ended"
+
+
+def test_auto_cleanup_expires_only_disconnected_desktop_auto_sessions_with_short_threshold(client):
+    from app import main as main_module
+
+    old_auto_empty = create_session(client, "Auto · old empty")
+    old_auto_with_text = create_session(client, "Auto · old captured session")
+    old_manual = create_session(client, "Manual session")
+    backdate_meeting(old_auto_empty["id"], 20)
+    backdate_meeting(old_auto_with_text["id"], 20)
+    backdate_meeting(old_manual["id"], 10)
+    add_segment(old_auto_with_text["id"], text="Saved auto transcript.", created_at=datetime.now(timezone.utc) - timedelta(minutes=10))
+
+    # The API must not mark an actually connected auto session as stale.
+    main_module.ACTIVE_MEETING_CONNECTIONS[old_auto_with_text["id"]] = 1
+    try:
+        first = client.post("/api/meetings/cleanup?auto_idle_minutes=5")
+        assert first.status_code == 200
+        assert client.get(f"/api/meetings/{old_auto_empty['id']}").status_code == 404
+        assert client.get(f"/api/meetings/{old_auto_with_text['id']}").json()["status"] == "active"
+        assert client.get(f"/api/meetings/{old_manual['id']}").json()["status"] == "active"
+    finally:
+        main_module.ACTIVE_MEETING_CONNECTIONS.pop(old_auto_with_text["id"], None)
+
+    second = client.post("/api/meetings/cleanup?auto_idle_minutes=5")
+    assert second.status_code == 200
+    assert client.get(f"/api/meetings/{old_auto_with_text['id']}").json()["status"] == "ended"
+    assert client.get(f"/api/meetings/{old_manual['id']}").json()["status"] == "active"
+
+
+def test_native_window_recovery_key_resumes_same_zoom_session_when_title_falls_back(client):
+    payload = {
+        "title": "Auto · Avantika Pandey's Zoom Meeting",
+        "capture_key": "zoom:window:34404:50122",
+        "process_name": "Zoom",
+    }
+    first = client.post("/api/meetings/auto", json=payload)
+    assert first.status_code == 200, first.text
+    original_id = first.json()["meeting"]["id"]
+    assert first.json()["reused"] is False
+    assert client.post(f"/api/meetings/{original_id}/suspend").status_code == 200
+
+    # Zoom may show the generic title after Contexa restarts while retaining PID/HWND.
+    resumed = client.post("/api/meetings/auto", json={
+        "title": "Auto · Zoom Meeting",
+        "capture_key": "zoom:window:34404:50122",
+        "process_name": "Zoom",
+    })
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["reused"] is True
+    assert resumed.json()["meeting"]["id"] == original_id
+    assert resumed.json()["meeting"]["status"] == "active"
+
+
+def test_first_restart_after_native_window_key_rollout_adopts_one_recent_legacy_zoom_session(client):
+    legacy = create_session(client, "Auto · Avantika Pandey's Zoom Meeting")
+    assert client.post(f"/api/meetings/{legacy['id']}/suspend").status_code == 200
+
+    recovered = client.post("/api/meetings/auto", json={
+        "title": "Auto · Zoom Meeting",
+        "capture_key": "zoom:window:34404:50122",
+        "process_name": "Zoom",
+    })
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["reused"] is True
+    assert recovered.json()["meeting"]["id"] == legacy["id"]
+    assert client.get(f"/api/meetings/{legacy['id']}").json()["status"] == "active"
+
+
+def test_native_window_key_does_not_reuse_a_different_named_meeting_on_same_window(client):
+    first = client.post("/api/meetings/auto", json={
+        "title": "Auto · Daily Standup on Zoom",
+        "capture_key": "zoom:window:34404:50122",
+        "process_name": "Zoom",
+    })
+    assert first.status_code == 200, first.text
+    old_id = first.json()["meeting"]["id"]
+    add_segment(old_id, text="Daily standup notes should remain in history.")
+    assert client.post(f"/api/meetings/{old_id}/suspend").status_code == 200
+
+    second = client.post("/api/meetings/auto", json={
+        "title": "Auto · Customer Review on Zoom",
+        "capture_key": "zoom:window:34404:50122",
+        "process_name": "Zoom",
+    })
+    assert second.status_code == 200, second.text
+    assert second.json()["reused"] is False
+    assert second.json()["meeting"]["id"] != old_id
+    assert client.get(f"/api/meetings/{old_id}").json()["status"] == "ended"
+
+
+def test_new_webex_call_epoch_creates_a_new_auto_session_after_the_previous_call_ended(client):
+    first = client.post("/api/meetings/auto", json={
+        "title": "Auto · Webex",
+        "capture_key": "webex:window:18760:10093378",
+        "process_name": "CiscoCollabHost",
+    })
+    assert first.status_code == 200, first.text
+    first_meeting = first.json()["meeting"]
+    assert first.json()["reused"] is False
+
+    ended = client.post(f"/api/meetings/{first_meeting['id']}/end")
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["status"] == "ended"
+
+    second = client.post("/api/meetings/auto", json={
+        "title": "Auto · Webex",
+        "capture_key": "webex:window:18760:3348120-call2",
+        "process_name": "CiscoCollabHost",
+    })
+    assert second.status_code == 200, second.text
+    assert second.json()["reused"] is False
+    assert second.json()["meeting"]["id"] != first_meeting["id"]
+    assert client.get(f"/api/meetings/{first_meeting['id']}").json()["status"] == "ended"
+    assert client.get(f"/api/meetings/{second.json()['meeting']['id']}").json()["status"] == "active"
+

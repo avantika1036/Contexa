@@ -19,13 +19,15 @@ export async function createMeetingSession({
   apiBase,
   title,
   sessionKey,
+  captureKey = sessionKey,
   processName,
   fetchImpl = fetch,
 }) {
-  const durableIdentity = isDurableMeetingKey(sessionKey);
+  const persistedCaptureKey = String(captureKey || sessionKey || '').trim();
+  const durableIdentity = isDurableMeetingKey(persistedCaptureKey);
   const endpoint = durableIdentity ? `${apiBase}/api/meetings/auto` : `${apiBase}/api/meetings`;
   const payload = durableIdentity
-    ? { title: `Auto · ${title}`.slice(0, 200), capture_key: sessionKey, process_name: processName }
+    ? { title: `Auto · ${title}`.slice(0, 200), capture_key: persistedCaptureKey, process_name: processName }
     : { title: `Auto · ${title}`.slice(0, 200) };
 
   let response = await fetchImpl(endpoint, {

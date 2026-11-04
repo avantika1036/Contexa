@@ -138,6 +138,88 @@ def _memory_migration_message() -> str:
         "Existing meetings and transcripts are preserved; do not reset the database volume."
     )
 
+
+_NATIVE_WINDOW_CAPTURE_KEY = re.compile(
+    r"^(?P<provider>zoom|teams|webex):window:(?P<pid>\d+):(?P<window>[A-Za-z0-9_-]{1,80})$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_auto_meeting_title(value: str | None) -> str:
+    title = str(value or "").strip()
+    title = re.sub(r"^auto\s*·\s*", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title)
+    return title.strip(" \t-–—|·").lower()
+
+
+def _is_generic_native_meeting_title(provider: str, title: str) -> bool:
+    normalized = _normalize_auto_meeting_title(title)
+    generic = {
+        "zoom": {
+            "zoom", "zoom meeting", "zoom workplace", "meeting", "call", "meeting in progress",
+        },
+        "teams": {
+            "teams", "microsoft teams", "teams meeting", "microsoft teams meeting",
+            "meeting", "meeting join | microsoft teams meeting", "join meeting | microsoft teams",
+        },
+        "webex": {
+            "webex", "cisco webex", "cisco webex meetings", "webex meeting", "meeting",
+            "get ready to join · meeting · webex", "in meeting · meeting · webex",
+        },
+    }
+    if normalized in generic.get(provider, set()):
+        return True
+    if provider == "webex" and ("get ready to join" in normalized or "in meeting" in normalized):
+        return True
+    return False
+
+
+def _native_window_titles_compatible(provider: str, existing_title: str, incoming_title: str) -> bool:
+    existing = _normalize_auto_meeting_title(existing_title)
+    incoming = _normalize_auto_meeting_title(incoming_title)
+    if not existing or not incoming or existing == incoming:
+        return True
+    # On restart, Zoom/Teams/Webex can temporarily replace a descriptive title with
+    # a generic provider title while preserving the same process/HWND capture key.
+    return (
+        _is_generic_native_meeting_title(provider, existing)
+        or _is_generic_native_meeting_title(provider, incoming)
+    )
+
+
+def _legacy_native_auto_candidates(db: Session, provider: str, incoming_title: str) -> list[Meeting]:
+    """Find one recent unkeyed native auto session left by a pre-window-key desktop build."""
+    rows = list(db.scalars(
+        select(Meeting)
+        .where(
+            Meeting.capture_key.is_(None),
+            Meeting.status.in_(["active", "suspended"]),
+            Meeting.title.ilike("Auto · %"),
+        )
+        .order_by(Meeting.created_at.desc())
+        .limit(20)
+    ).all())
+    grace_seconds = max(0, int(settings.suspended_session_resume_grace_seconds))
+    now = datetime.now(timezone.utc)
+    marker = {"zoom": "zoom", "teams": "teams", "webex": "webex"}[provider]
+    candidates: list[Meeting] = []
+    for row in rows:
+        if ACTIVE_MEETING_CONNECTIONS.get(row.id, 0) > 0 or ACTIVE_MEETING_STREAMS.get(row.id, 0) > 0:
+            continue
+        if marker not in _normalize_auto_meeting_title(row.title):
+            continue
+        if not _native_window_titles_compatible(provider, row.title, incoming_title):
+            continue
+        last_activity = _aware(row.suspended_at or row.created_at)
+        latest_segment = db.scalar(
+            select(func.max(TranscriptSegment.created_at)).where(TranscriptSegment.meeting_id == row.id)
+        )
+        if latest_segment is not None:
+            last_activity = max(last_activity, _aware(latest_segment))
+        if max(0.0, (now - last_activity).total_seconds()) <= grace_seconds:
+            candidates.append(row)
+    return candidates
+
 app = FastAPI(
     title=settings.app_name,
     version="0.3.0",
@@ -370,10 +452,35 @@ def create_or_reuse_auto_meeting(
         )
     )
     if existing is not None:
+        native_key_match = _NATIVE_WINDOW_CAPTURE_KEY.fullmatch(payload.capture_key)
+        if native_key_match and not _native_window_titles_compatible(
+            native_key_match.group("provider").lower(), existing.title, payload.title
+        ):
+            if ACTIVE_MEETING_CONNECTIONS.get(existing.id, 0) > 0 or ACTIVE_MEETING_STREAMS.get(existing.id, 0) > 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This native window recovery key is still connected to a different meeting title.",
+                )
+            memory_count = int(db.scalar(
+                select(func.count()).select_from(MemoryItem).where(MemoryItem.meeting_id == existing.id)
+            ) or 0)
+            if _segment_count(db, existing.id) == 0 and memory_count == 0:
+                stale_id = existing.id
+                _delete_meeting_records(db, stale_id)
+                logger.info("Discarded empty suspended native session %s because the same window now reports a different meeting title", stale_id)
+            else:
+                _finish_active_meeting(existing, db, background_tasks, session_factory)
+                logger.info("Finalized prior native meeting %s because the same window now reports a different meeting title", existing.id)
+            existing = None
+
+    if existing is not None:
         # Older desktop builds created "Auto · Meet" before Google exposed its call code,
         # then upgraded only an in-memory key. Reconcile the single recent unkeyed row here
         # before opening a new WebSocket so restart recovery does not create another history item.
-        legacy_candidates = [row for row in _legacy_auto_meet_candidates(db) if row.id != existing.id]
+        legacy_candidates = (
+            [row for row in _legacy_auto_meet_candidates(db) if row.id != existing.id]
+            if payload.capture_key.lower().startswith("meet:") else []
+        )
         if len(legacy_candidates) == 1 and ACTIVE_MEETING_CONNECTIONS.get(existing.id, 0) == 0:
             _merge_legacy_auto_meet_into(legacy_candidates[0], existing, db)
         elif legacy_candidates:
@@ -416,9 +523,37 @@ def create_or_reuse_auto_meeting(
             db.refresh(existing)
             return {"meeting": existing, "reused": True}
 
+    # Native desktop sessions created by earlier builds may have no capture_key. If exactly
+    # one recent, disconnected unkeyed Auto row matches this provider and the incoming/generic
+    # title pair, adopt it so the first restart after installing durable window keys does not
+    # create a duplicate history entry.
+    native_key_match = _NATIVE_WINDOW_CAPTURE_KEY.fullmatch(payload.capture_key)
+    if native_key_match:
+        provider = native_key_match.group("provider").lower()
+        native_legacy_candidates = _legacy_native_auto_candidates(db, provider, payload.title)
+        if len(native_legacy_candidates) == 1:
+            legacy = native_legacy_candidates[0]
+            legacy.capture_key = payload.capture_key
+            legacy.title = payload.title[:200]
+            legacy.capture_process_name = payload.process_name or legacy.capture_process_name
+            legacy.audio_source = "desktop_auto"
+            if legacy.status == "suspended":
+                legacy.status = "active"
+                legacy.suspended_at = None
+                legacy.ended_at = None
+            try:
+                db.commit()
+                db.refresh(legacy)
+                logger.info("Adopted prior unkeyed %s session %s with native window recovery key %s", provider, legacy.id, payload.capture_key)
+                return {"meeting": legacy, "reused": True}
+            except IntegrityError:
+                db.rollback()
+                logger.exception("Could not adopt prior native session for recovery key %s", payload.capture_key)
+                raise HTTPException(status_code=409, detail="Could not safely adopt the previous native meeting session.")
+
     # No stable row exists. If exactly one recent legacy provisional Auto · Meet row exists,
     # upgrade it in place instead of creating a duplicate session after an Electron restart.
-    legacy_candidates = _legacy_auto_meet_candidates(db)
+    legacy_candidates = _legacy_auto_meet_candidates(db) if payload.capture_key.lower().startswith("meet:") else []
     if len(legacy_candidates) == 1:
         legacy = legacy_candidates[0]
         legacy.capture_key = payload.capture_key
@@ -687,6 +822,7 @@ def cleanup_meetings(
     background_tasks: BackgroundTasks,
     purge_empty: bool = Query(default=False, description="Also delete ended sessions that have no transcript."),
     idle_minutes: int | None = Query(default=None, ge=1, le=1440),
+    auto_idle_minutes: int | None = Query(default=None, ge=1, le=1440, description="Optional shorter stale timeout for disconnected desktop-auto sessions only. Live connections are always protected."),
     db: Session = Depends(get_db),
     session_factory: sessionmaker[Session] = Depends(get_session_factory),
 ) -> dict[str, int]:
@@ -712,7 +848,9 @@ def cleanup_meetings(
                 continue
         else:
             last_activity = _aware(latest_segment or meeting.created_at)
-            if (now - last_activity).total_seconds() < threshold_minutes * 60:
+            is_desktop_auto = meeting.audio_source == "desktop_auto" or meeting.title.strip().lower().startswith("auto · ")
+            effective_threshold_minutes = auto_idle_minutes if is_desktop_auto and auto_idle_minutes is not None else threshold_minutes
+            if (now - last_activity).total_seconds() < effective_threshold_minutes * 60:
                 continue
         if _segment_count(db, meeting.id) == 0:
             _delete_meeting_records(db, meeting.id)

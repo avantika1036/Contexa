@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('contexaDesktop', {
   getStatus: () => ipcRenderer.invoke('contexa:get-status'),
   enableAutoCapture: () => ipcRenderer.invoke('contexa:enable-auto-capture'),
   pauseAutoCapture: () => ipcRenderer.invoke('contexa:pause-auto-capture'),
+  endAutoCapturedMeeting: (meetingId) => ipcRenderer.invoke('contexa:end-auto-captured-meeting', meetingId),
   onTranscript: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on('contexa:transcript', listener);

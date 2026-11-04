@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import "./App.css";
 
 type TabId = "ask" | "transcript" | "catchup" | "topic" | "decisions" | "memory";
 type ConnectionStatus = "connecting" | "connected" | "disconnected";
 type AudioSource = "tab" | "desktop" | "microphone" | "desktop_auto" | "web_auto";
-type MeetingStatus = "active" | "suspended" | "ended";
+type MeetingStatus = "active" | "ended";
 
 type Meeting = {
   id: string;
@@ -14,7 +14,6 @@ type Meeting = {
   audio_source: AudioSource | null;
   created_at: string;
   ended_at: string | null;
-  suspended_at?: string | null;
 };
 
 type TranscriptWord = {
@@ -196,6 +195,9 @@ function App() {
   );
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [selectedMeetingId, setSelectedMeetingId] = useState<string | null>(null);
+  // Automatic capture may follow a newly detected meeting until the user explicitly
+  // chooses a history item. After that, background polling must not steal selection.
+  const userPinnedMeetingSelectionRef = useRef(false);
   const [meetingsLoading, setMeetingsLoading] = useState(true);
   const [newMeetingTitle, setNewMeetingTitle] = useState("");
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -231,7 +233,6 @@ function App() {
   const [desktopActionMessage, setDesktopActionMessage] = useState("");
 
   const socketRef = useRef<WebSocket | null>(null);
-  const userSelectedMeetingRef = useRef(false);
   const newMeetingInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const firstChunkTimeoutRef = useRef<number | null>(null);
@@ -255,43 +256,6 @@ function App() {
     selectedMeetingStatus === "active" ? connection : "disconnected";
 
   const visibleChatMessages = chatMeetingId === selectedMeetingId ? chatMessages : [];
-
-  const applyTranscriptMessage = useCallback((message: ServerMessage) => {
-    if (message.type !== "transcript.segment" || message.meeting_id !== selectedMeetingId || !message.segment) return;
-    firstTranscriptReceivedRef.current = true;
-    if (firstTranscriptTimeoutRef.current !== null) {
-      window.clearTimeout(firstTranscriptTimeoutRef.current);
-      firstTranscriptTimeoutRef.current = null;
-    }
-    const segment = message.segment;
-    if (message.is_final || segment.is_final) {
-      setTranscriptSegments((current) => {
-        const withoutDuplicate = current.filter((item) => item.id !== segment.id);
-        return [...withoutDuplicate, { ...segment, is_final: true }].sort(
-          (a, b) => a.start_seconds - b.start_seconds,
-        );
-      });
-      setInterimTranscript((current) =>
-        current && Math.abs(current.start_seconds - segment.start_seconds) < 0.75
-          ? null
-          : current,
-      );
-      setCaptureMessage(message.speech_final
-        ? "Final transcript segment saved."
-        : "Transcript segment finalized and saved.");
-    } else {
-      setInterimTranscript(segment);
-      setCaptureMessage("Live transcript updating…");
-    }
-  }, [selectedMeetingId]);
-
-  useEffect(() => {
-    const desktop = window.contexaDesktop;
-    if (!desktop?.onTranscript) return;
-    return desktop.onTranscript((payload) => {
-      applyTranscriptMessage(payload as ServerMessage);
-    });
-  }, [applyTranscriptMessage]);
 
   useEffect(() => {
     if (activeTab === "ask" && chatMeetingId === selectedMeetingId) {
@@ -318,38 +282,24 @@ function App() {
           (meeting) => meeting.status === "active" && meeting.audio_source === "desktop_auto",
         );
         const preferred = autoMeeting ?? result.find((meeting) => meeting.status === "active") ?? result[0];
-        if (isFirstLoad) {
-          setSelectedMeetingId(preferred?.id ?? null);
-        } else if (!userSelectedMeetingRef.current) {
-          // Continue following an automatically detected meeting only until the user
-          // explicitly chooses a history item. Polling must never override that choice.
-          setSelectedMeetingId((current) => {
-            if (autoMeeting) return autoMeeting.id;
-            if (current && result.some((meeting) => meeting.id === current)) return current;
-            return preferred?.id ?? null;
-          });
-        } else {
-          // Keep a manually selected past meeting selected while the live meeting
-          // continues recording in the background. Fall back only if it was deleted.
-          setSelectedMeetingId((current) => (
-            current && result.some((meeting) => meeting.id === current)
-              ? current
-              : preferred?.id ?? null
-          ));
-        }
+        setSelectedMeetingId((current) => {
+          const currentStillExists = Boolean(current && result.some((meeting) => meeting.id === current));
+          if (userPinnedMeetingSelectionRef.current && currentStillExists) return current;
+          if (autoMeeting) return autoMeeting.id;
+          if (currentStillExists) return current;
+          return preferred?.id ?? null;
+        });
         if (firstLoad) {
           setShowCreateForm(result.length === 0);
           setConnection(preferred?.status === "active" ? "connecting" : "disconnected");
-          setConnectionMessage(preferred?.status === "suspended"
-            ? "This meeting is temporarily suspended. Contexa can resume it when the same meeting is detected again."
-            : preferred?.audio_source === "desktop_auto" && preferred?.status === "active"
-              ? "Automatic meeting capture detected. Loading live context…"
-              : preferred?.status === "active"
-                ? "Connecting to the selected meeting..."
-                : "Create a session or enable the Contexa Desktop app.");
+          setConnectionMessage(preferred?.audio_source === "desktop_auto"
+            ? "Automatic meeting capture detected. Loading live context…"
+            : preferred?.status === "active"
+              ? "Connecting to the selected meeting..."
+              : "Create a session or enable the Contexa Contexa Desktop app.");
           setSessionMessage("");
           firstLoad = false;
-        } else if (autoMeeting && !userSelectedMeetingRef.current) {
+        } else if (autoMeeting) {
           setConnectionMessage("Automatic meeting capture is active for this meeting.");
         }
       } catch (error) {
@@ -369,6 +319,43 @@ function App() {
       window.clearInterval(interval);
     };
   }, []);
+
+  useEffect(() => {
+    const desktop = window.contexaDesktop;
+    if (!isDesktopApp || !desktop?.onTranscript || !selectedMeetingId) return;
+
+    // Desktop auto-capture owns a separate backend WebSocket from the renderer.
+    // Subscribe to its IPC transcript events so interim Deepgram results can drive
+    // the green live-preview card; finalized segments are also reflected immediately
+    // and remain reconciled with the regular database transcript polling.
+    const unsubscribe = desktop.onTranscript((payload) => {
+      const message = payload as ServerMessage;
+      if (
+        message.type !== "transcript.segment"
+        || message.meeting_id !== selectedMeetingId
+        || !message.segment
+      ) return;
+
+      const segment = message.segment;
+      if (message.is_final || segment.is_final) {
+        setTranscriptSegments((current) => {
+          const withoutDuplicate = current.filter((item) => item.id !== segment.id);
+          return [...withoutDuplicate, { ...segment, is_final: true }].sort(
+            (a, b) => a.start_seconds - b.start_seconds,
+          );
+        });
+        setInterimTranscript((current) =>
+          current && Math.abs(current.start_seconds - segment.start_seconds) < 0.75
+            ? null
+            : current,
+        );
+      } else {
+        setInterimTranscript(segment);
+      }
+    });
+
+    return unsubscribe;
+  }, [selectedMeetingId]);
 
   useEffect(() => {
     if (!isDesktopApp || !window.contexaDesktop) return;
@@ -594,7 +581,31 @@ function App() {
           setCaptureMessage(`Connected to ${message.provider ?? transcriptionProvider} streaming transcription (${message.model ?? "configured model"}). Waiting for audible speech from the selected source.`);
           break;
         case "transcript.segment": {
-          applyTranscriptMessage(message);
+          firstTranscriptReceivedRef.current = true;
+          if (firstTranscriptTimeoutRef.current !== null) {
+            window.clearTimeout(firstTranscriptTimeoutRef.current);
+            firstTranscriptTimeoutRef.current = null;
+          }
+          const segment = message.segment;
+          if (!segment) break;
+          if (message.is_final || segment.is_final) {
+            setTranscriptSegments((current) => {
+              const withoutDuplicate = current.filter((item) => item.id !== segment.id);
+              return [...withoutDuplicate, { ...segment, is_final: true }].sort(
+                (a, b) => a.start_seconds - b.start_seconds,
+              );
+            });
+            setInterimTranscript((current) =>
+              current && Math.abs(current.start_seconds - segment.start_seconds) < 0.75
+                ? null
+                : current,
+            );
+            setCaptureMessage(message.speech_final
+              ? "Final transcript segment saved."
+              : "Transcript segment finalized and saved.");
+          } else {
+            setInterimTranscript(segment);
+          }
           break;
         }
         case "audio.chunk.received": {
@@ -673,7 +684,8 @@ function App() {
       socket.close();
     };
     // This WebSocket belongs to exactly one selected active meeting session.
-  }, [selectedMeetingId, selectedMeetingStatus, applyTranscriptMessage]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedMeetingId, selectedMeetingStatus]);
 
   function sendMessage(payload: Record<string, unknown>): boolean {
     const socket = socketRef.current;
@@ -686,21 +698,15 @@ function App() {
   }
 
   function selectMeeting(nextId: string | null) {
-    userSelectedMeetingRef.current = true;
+    userPinnedMeetingSelectionRef.current = true;
     const nextMeeting = meetings.find((meeting) => meeting.id === nextId) ?? null;
     setShowCreateForm(false);
     setSessionMessage("");
-    setActiveTab("transcript");
-
-    // Clicking the already-selected history row must not clear its transcript.
-    // Because the ID is unchanged, React will not rerun the transcript-loading effect;
-    // clearing the array here made the transcript appear to alternate with an empty view.
-    if (nextId === selectedMeetingId) return;
-
     setTranscriptSegments([]);
     setInterimTranscript(null);
     setSelectedMeetingId(nextId);
     setConsentConfirmed(false);
+    setActiveTab("transcript");
     setConnection(nextMeeting?.status === "active" ? "connecting" : "disconnected");
     setConnectionMessage(
       nextMeeting?.status === "active"
@@ -725,8 +731,8 @@ function App() {
       if (!response.ok) throw new Error(await responseError(response));
 
       const created = (await response.json()) as Meeting;
+      userPinnedMeetingSelectionRef.current = true;
       setMeetings((current) => [created, ...current]);
-      userSelectedMeetingRef.current = true;
       setSelectedMeetingId(created.id);
       setConnection("connecting");
       setConnectionMessage("Connecting to the new meeting session...");
@@ -753,6 +759,15 @@ function App() {
     setSessionMessage("");
 
     try {
+      if (selectedMeeting.audio_source === 'desktop_auto') {
+        const desktop = window.contexaDesktop;
+        if (!desktop?.endAutoCapturedMeeting) {
+          throw new Error('The desktop capture controller is unavailable. Restart Contexa and try again.');
+        }
+        const desktopResult = await desktop.endAutoCapturedMeeting(selectedMeeting.id);
+        if (!desktopResult.ok) throw new Error(desktopResult.message || 'Could not stop desktop meeting capture.');
+        setDesktopStatus(desktopResult.status);
+      }
       if (mediaRecorderRef.current) await stopCapture();
       const response = await fetch(`${API_BASE}/api/meetings/${selectedMeeting.id}/end`, {
         method: "POST",
@@ -1282,17 +1297,9 @@ function App() {
     }
   }
 
-  // The Auto Capture card reflects the desktop app's live state only. It must not depend on which
-  // meeting is selected: opening an old auto-captured meeting must not make it look like capture is on.
+  const isAutoCaptureSession = selectedMeeting?.audio_source === "desktop_auto";
   const isAutoCaptureEnabled = isDesktopApp && desktopStatus?.autoCaptureEnabled === true;
-  const isAutoCapturing = isAutoCaptureEnabled && desktopStatus?.captureActive === true;
-  const autoCaptureStatusLabel = isAutoCapturing
-    ? "Capturing meeting"
-    : isAutoCaptureEnabled
-      ? "Monitoring for meetings"
-      : captureActive
-        ? "Manual capture running"
-        : "Paused";
+  const isMeetingCapturing = captureActive || isAutoCaptureSession || desktopStatus?.captureActive === true;
   const decisionItems = selectedMemoryItems.filter((item) => ["decision", "open_question", "action_item", "argument"].includes(item.item_type));
   const confirmedDecisionItems = selectedMemoryItems.filter((item) => item.item_type === "decision");
   const actionItems = selectedMemoryItems.filter((item) => item.item_type === "action_item");
@@ -1351,6 +1358,7 @@ function App() {
           className="sidebar-new-meeting"
           type="button"
           onClick={() => {
+            userPinnedMeetingSelectionRef.current = true;
             setShowCreateForm(true);
             setSessionMessage("Name your new meeting.");
             window.setTimeout(() => newMeetingInputRef.current?.focus(), 0);
@@ -1373,11 +1381,11 @@ function App() {
               onClick={() => selectMeeting(meeting.id)}
               title={meeting.title}
             >
-              <span className={`sidebar-meeting-state ${meeting.status === "active" ? "is-active" : meeting.status === "suspended" ? "is-suspended" : ""}`} />
+              <span className={`sidebar-meeting-state ${meeting.status === "active" ? "is-active" : ""}`} />
               <span className="sidebar-meeting-text">
                 <span className="sidebar-meeting-title">{meeting.title}</span>
                 <span className="sidebar-meeting-meta">
-                  {meeting.status === "active" ? "In progress" : meeting.status === "suspended" ? "Recoverable · paused" : formatMeetingDate(meeting.created_at)}
+                  {meeting.status === "active" ? "In progress" : formatMeetingDate(meeting.created_at)}
                 </span>
               </span>
             </button>
@@ -1387,10 +1395,10 @@ function App() {
         {isDesktopApp && (
           <div className="sidebar-capture-card">
             <div className="capture-card-topline">
-              <span className={`capture-indicator ${isAutoCaptureEnabled ? "active" : ""}`} />
+              <span className={`capture-indicator ${isMeetingCapturing || isAutoCaptureEnabled ? "active" : ""}`} />
               <span>AUTO CAPTURE</span>
             </div>
-            <strong>{autoCaptureStatusLabel}</strong>
+            <strong>{isMeetingCapturing ? "Capturing meeting" : isAutoCaptureEnabled ? "Monitoring for meetings" : "Paused"}</strong>
             <button
               className={`capture-toggle-button ${desktopStatus?.autoCaptureEnabled ? "toggle-enabled" : ""}`}
               type="button"
@@ -1426,7 +1434,7 @@ function App() {
                 <h1>{selectedMeeting?.title ?? "Your meetings"}</h1>
                 <p className="meeting-subtitle">
                   {selectedMeeting
-                    ? `${selectedMeeting.status === "active" ? "In progress" : selectedMeeting.status === "suspended" ? "Temporarily suspended" : "Completed"} · ${formatMeetingDate(selectedMeeting.created_at)}`
+                    ? `${selectedMeeting.status === "active" ? "In progress" : "Completed"} · ${formatMeetingDate(selectedMeeting.created_at)}`
                     : "Choose a meeting from history or create a new one."}
                 </p>
               </div>
@@ -1457,12 +1465,6 @@ function App() {
               </section>
             )}
 
-            {selectedMeeting?.status === "suspended" && (
-              <div className="active-session-strip suspended-session-strip">
-                <span>Capture suspended · session can be resumed during the recovery window</span>
-              </div>
-            )}
-
             {selectedMeeting?.status === "active" && (
               <div className="active-session-strip">
                 <span><span className="status-dot" /> Meeting in progress</span>
@@ -1478,8 +1480,8 @@ function App() {
               <section className="meeting-overview" aria-label="Meeting overview">
                 <div className="overview-section-heading">
                   <div><span className="overview-eyebrow">OVERVIEW</span><h2>Meeting at a glance</h2></div>
-                  <span className={`overview-source-pill ${selectedMeeting.status === "active" ? "is-live" : selectedMeeting.status === "suspended" ? "is-suspended" : ""}`}>
-                    {selectedMeeting.status === "active" ? "Live" : selectedMeeting.status === "suspended" ? "Recoverable" : "Saved"}
+                  <span className={`overview-source-pill ${selectedMeeting.status === "active" ? "is-live" : ""}`}>
+                    {selectedMeeting.status === "active" ? "Live" : "Saved"}
                   </span>
                 </div>
 
@@ -1611,7 +1613,7 @@ function App() {
               <div className="copilot-title"><h2>Meeting context</h2></div>
               <span className={`mini-status ${selectedMeeting?.status === "ended" ? "saved" : effectiveConnection}`}>
                 <span className="status-dot" />
-                {selectedMeeting?.status === "ended" ? "Saved" : selectedMeeting?.status === "suspended" ? "Suspended" : !selectedMeeting ? "No meeting" : effectiveConnection === "connected" ? "Live" : effectiveConnection === "connecting" ? "Connecting" : "Waiting"}
+                {selectedMeeting?.status === "ended" ? "Saved" : !selectedMeeting ? "No meeting" : effectiveConnection === "connected" ? "Live" : effectiveConnection === "connecting" ? "Connecting" : "Waiting"}
               </span>
             </div>
             <div className="copilot-tabs" role="tablist" aria-label="Meeting context views">

@@ -1,73 +1,16 @@
 import { isDurableMeetingKey, meetingKey } from './meeting-session.mjs';
 import { normalizeMeetingWindows } from './capture-policy.mjs';
+import { detectProviderWindow } from './providers/index.mjs';
 
-const NATIVE_PROCESS_PROVIDERS = new Map([
-  ['zoom', 'zoom'],
-  ['zoomworkplace', 'zoom'],
-  ['zoommeetings', 'zoom'],
-  ['msteams', 'teams'],
-  ['teams', 'teams'],
-  ['webex', 'webex'],
-  ['ciscocollabhost', 'webex'],
-]);
-
-const BROWSER_PROCESS_NAMES = new Set([
-  'chrome', 'msedge', 'brave', 'firefox', 'chromium', 'opera',
-]);
-
-const TITLE_RULES = [
-  {
-    provider: 'google_meet',
-    rule: 'google_meet_title',
-    pattern: /google meet|meet\.google|\bmeet\s*[-–|]\s*[a-z]{3}-[a-z]{4}-[a-z]{3}\b/i,
-  },
-  {
-    provider: 'zoom',
-    rule: 'zoom_meeting_title',
-    pattern: /zoom\.us|zoom workplace|zoom meeting|\bzoom\b.*\b(call|meeting)\b|\b(call|meeting)\b.*\bzoom\b/i,
-  },
-  {
-    provider: 'teams',
-    rule: 'teams_meeting_title',
-    pattern: /teams\.microsoft|microsoft teams|\bteams\b.*\b(meeting|call)\b|\b(meeting|call)\b.*\bteams\b/i,
-  },
-  {
-    provider: 'webex',
-    rule: 'webex_meeting_title',
-    pattern: /webex|cisco webex/i,
-  },
-];
-
-const JOINING_PATTERN = /waiting room|waiting to be admitted|waiting for (?:the )?host|connecting to (?:the )?meeting|joining (?:the )?(?:meeting|call)/i;
-const ENDED_PATTERN = /you (?:have )?left (?:the )?(?:meeting|call)|left the meeting|meeting has ended|meeting ended|call has ended|call ended|host ended the meeting/i;
+const JOINING_PATTERN = /waiting room|waiting to be admitted|waiting for (?:the )?(?:host|organizer)|connecting to (?:the )?meeting|joining (?:the )?(?:meeting|call)|meeting\s+join(?:ing)?|ready to join|join (?:now|meeting|call)\b/i;
+const LEFT_PATTERN = /you (?:have )?left (?:the|this) (?:meeting|call)|left (?:the|this) meeting|left (?:the|this) call/i;
+const ENDED_PATTERN = /meeting has ended|meeting ended|call has ended|call ended|(?:host|organizer) ended (?:the )?(?:meeting|call)/i;
 
 function normalizeProcessName(value) {
   return String(value || '')
     .toLowerCase()
     .replace(/\.exe$/, '')
     .replace(/[\s_-]/g, '');
-}
-
-function inferProvider(processName, title) {
-  const process = normalizeProcessName(processName);
-  const nativeProvider = NATIVE_PROCESS_PROVIDERS.get(process);
-  if (nativeProvider) {
-    return {
-      provider: nativeProvider,
-      source: 'native_window',
-      rule: `native_process:${process}`,
-    };
-  }
-
-  const browserLike = BROWSER_PROCESS_NAMES.has(process);
-  if (!browserLike) return null;
-  const rule = TITLE_RULES.find((candidate) => candidate.pattern.test(String(title || '')));
-  if (!rule) return null;
-  return {
-    provider: rule.provider,
-    source: 'browser_window',
-    rule: rule.rule,
-  };
 }
 
 function extractProviderMeetingId(provider, title, identityKey) {
@@ -86,6 +29,7 @@ function extractProviderMeetingId(provider, title, identityKey) {
 
 function inferLifecycleState(title, foreground) {
   const text = String(title || '');
+  if (LEFT_PATTERN.test(text)) return 'left';
   if (ENDED_PATTERN.test(text)) return 'ended';
   if (JOINING_PATTERN.test(text)) return 'joining';
   // A background window is a focus observation, not proof that the provider call
@@ -110,19 +54,19 @@ export function createMeetingObservation(windowInfo, { observedAt = Date.now() }
 
   const processName = String(windowInfo.processName || '');
   const title = String(windowInfo.title || '').trim();
-  const providerMatch = inferProvider(processName, title);
+  const providerMatch = detectProviderWindow(processName, title, windowInfo);
   if (!providerMatch) return null;
 
-  const identityKey = meetingKey(processName, title);
-  const meetingId = extractProviderMeetingId(providerMatch.provider, title, identityKey);
-  const confidence = inferConfidence({
+  const identityKey = providerMatch.identityKey || meetingKey(processName, title);
+  const meetingId = providerMatch.meetingId || extractProviderMeetingId(providerMatch.provider, title, identityKey);
+  const confidence = providerMatch.confidence || inferConfidence({
     identityKey,
     provider: providerMatch.provider,
     source: providerMatch.source,
     rule: providerMatch.rule,
   });
   const foreground = Boolean(windowInfo.foreground);
-  const state = inferLifecycleState(title, foreground);
+  const state = providerMatch.lifecycleState || inferLifecycleState(title, foreground);
 
   return {
     // Provider-neutral observation contract.
@@ -140,13 +84,12 @@ export function createMeetingObservation(windowInfo, { observedAt = Date.now() }
     displayTitle: title,
     windowFocus: foreground ? 'foreground' : 'background',
     evidence: [
-      { kind: 'process', rule: providerMatch.rule },
+      ...(Array.isArray(providerMatch.evidence) ? providerMatch.evidence : [{ kind: 'process', rule: providerMatch.rule }]),
       ...(meetingId ? [{ kind: 'provider_meeting_id', value: meetingId }] : []),
       { kind: 'window_focus', value: foreground ? 'foreground' : 'background' },
     ],
 
-    // Phase 1 compatibility aliases; these are intentionally retained until the
-    // provider adapters and lifecycle registry are migrated in Phase 2.2/2.3.
+    // Phase 1 compatibility aliases; retained while the lifecycle registry migrates.
     pid: Number(windowInfo.pid),
     title,
     foreground,
@@ -174,3 +117,34 @@ export const MEETING_OBSERVATION_STATES = Object.freeze([
 export const MEETING_OBSERVATION_CONFIDENCE = Object.freeze([
   'high', 'medium', 'low',
 ]);
+
+/**
+ * Promote the observation that belongs to the currently running capture to `active`.
+ * This is deliberately conservative: title evidence such as `joining` or `ended` takes
+ * precedence, and a browser process alone is never enough to mark an arbitrary tab active.
+ */
+export function markActiveMeetingObservations(observations, currentCapture) {
+  if (!currentCapture) return observations;
+  const currentKey = String(currentCapture.sessionKey || '');
+  const currentPid = Number(currentCapture.processId);
+  const currentProcess = normalizeProcessName(currentCapture.processName);
+
+  return observations.map((observation) => {
+    if (observation.state === 'joining' || observation.state === 'left' || observation.state === 'ended') return observation;
+
+    const sameIdentity = observation.identityKey === currentKey;
+    const sameProcess = Number(observation.pid) === currentPid
+      && normalizeProcessName(observation.processName) === currentProcess;
+    const googleMeetIdentityUpgrade = currentKey === 'browser:*'
+      && sameProcess
+      && observation.provider === 'google_meet'
+      && observation.durableIdentity;
+    const durableIdentityMovedProcess = observation.durableIdentity
+      && sameIdentity;
+
+    if (sameIdentity && (sameProcess || durableIdentityMovedProcess) || googleMeetIdentityUpgrade) {
+      return { ...observation, state: 'active' };
+    }
+    return observation;
+  });
+}

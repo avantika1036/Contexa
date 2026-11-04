@@ -143,3 +143,23 @@ test('identity upgrade preserves the HTTP status for an existing stable-identity
     (error) => error.status === 409 && /Another open session/.test(error.message),
   );
 });
+
+
+test('native window recovery key uses the durable auto endpoint even when semantic meeting key is descriptive', async () => {
+  const calls = [];
+  const result = await createMeetingSession({
+    apiBase: 'http://127.0.0.1:8000',
+    title: "Avantika Pandey's Zoom Meeting",
+    sessionKey: "zoom:avantika pandey's zoom meeting",
+    captureKey: 'zoom:window:34404:50122',
+    processName: 'Zoom',
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return response(200, { meeting: { id: 'existing-zoom', title: "Auto · Avantika Pandey's Zoom Meeting", status: 'active' }, reused: true });
+    },
+  });
+  assert.equal(calls[0].url, 'http://127.0.0.1:8000/api/meetings/auto');
+  assert.equal(JSON.parse(calls[0].options.body).capture_key, 'zoom:window:34404:50122');
+  assert.equal(result.id, 'existing-zoom');
+  assert.equal(result.reused_by_server, true);
+});

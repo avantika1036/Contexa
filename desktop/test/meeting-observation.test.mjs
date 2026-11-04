@@ -3,10 +3,14 @@ import assert from 'node:assert/strict';
 import {
   createMeetingObservation,
   normalizeMeetingObservations,
+  markActiveMeetingObservations,
   MEETING_OBSERVATION_PROVIDERS,
   MEETING_OBSERVATION_STATES,
   MEETING_OBSERVATION_CONFIDENCE,
 } from '../meeting-observation.mjs';
+import { selectStartCandidate } from '../capture-policy.mjs';
+import { classifyWindowTransition } from '../meeting-session.mjs';
+import { WebexMeetingControlTracker } from '../webex-meeting-controls.mjs';
 
 test('exports the provider-neutral observation contract enums', () => {
   assert.deepEqual(MEETING_OBSERVATION_PROVIDERS, ['google_meet', 'zoom', 'teams', 'webex']);
@@ -59,11 +63,15 @@ test('marks explicit waiting and ended title evidence without inferring active f
   const waiting = createMeetingObservation({
     pid: 36380, processName: 'chrome', title: 'Meet - abc-defg-hij - Waiting for host', foreground: true,
   });
-  const ended = createMeetingObservation({
+  const left = createMeetingObservation({
     pid: 36380, processName: 'chrome', title: 'Meet - abc-defg-hij - You left the meeting', foreground: true,
+  });
+  const ended = createMeetingObservation({
+    pid: 36380, processName: 'chrome', title: 'Meet - abc-defg-hij - Meeting has ended', foreground: true,
   });
 
   assert.equal(waiting.state, 'joining');
+  assert.equal(left.state, 'left');
   assert.equal(ended.state, 'ended');
 });
 
@@ -124,4 +132,87 @@ test('returns null when a window cannot be assigned to a supported provider', ()
   assert.equal(createMeetingObservation({
     pid: 1, processName: 'notepad', title: 'Weekly notes', foreground: true,
   }), null);
+});
+
+
+test('observations retain the legacy detector shape used by capture policy and continuity', () => {
+  const observations = normalizeMeetingObservations([
+    { pid: 36380, processName: 'chrome', title: 'Meet - abc-defg-hij', foreground: true, windowId: 'HWND-1' },
+  ]);
+  const selected = selectStartCandidate(observations, null, Date.now(), (item) => item.identityKey).candidate;
+  assert.equal(selected.provider, 'google_meet');
+  assert.equal(selected.pid, 36380);
+  assert.equal(selected.foreground, true);
+  assert.equal(selected.identityKey, 'meet:abc-defg-hij');
+  assert.equal(classifyWindowTransition(observations, {
+    processId: 36380, processName: 'chrome', sessionKey: 'meet:abc-defg-hij',
+  }).type, 'same-window');
+});
+
+test('marks only the currently captured observation active and preserves joining or ended evidence', () => {
+  const observations = normalizeMeetingObservations([
+    { pid: 36380, processName: 'chrome', title: 'Meet - abc-defg-hij', foreground: false },
+    { pid: 36380, processName: 'chrome', title: 'Meet - xyz-abcd-efg - Waiting for host', foreground: true },
+    { pid: 36380, processName: 'chrome', title: 'Meet - hij-klmn-opq - Meeting has ended', foreground: false },
+    { pid: 36380, processName: 'chrome', title: 'Meet - rst-uvwx-yza - You left the meeting', foreground: false },
+  ]);
+  const marked = markActiveMeetingObservations(observations, {
+    processId: 36380, processName: 'chrome', sessionKey: 'meet:abc-defg-hij',
+  });
+  const statesByIdentity = Object.fromEntries(marked.map((item) => [item.identityKey, item.state]));
+  assert.equal(statesByIdentity['meet:abc-defg-hij'], 'active');
+  assert.equal(statesByIdentity['meet:xyz-abcd-efg'], 'joining');
+  assert.equal(statesByIdentity['meet:hij-klmn-opq'], 'ended');
+  assert.equal(statesByIdentity['meet:rst-uvwx-yza'], 'left');
+});
+
+test('promotes a Google Meet call code as active when the capture started before the code appeared', () => {
+  const observations = normalizeMeetingObservations([
+    { pid: 36380, processName: 'chrome', title: 'Meet - abc-defg-hij', foreground: true },
+  ]);
+  const marked = markActiveMeetingObservations(observations, {
+    processId: 36380, processName: 'chrome', sessionKey: 'browser:*',
+  });
+  assert.equal(marked[0].state, 'active');
+});
+
+
+test('Webex canonical HWND and call epoch survive the second normalization pass', () => {
+  const tracker = new WebexMeetingControlTracker();
+  const host = (windowId) => ({
+    pid: 18760,
+    processName: 'CiscoCollabHost',
+    title: 'Webex',
+    windowId,
+    foreground: false,
+    webexHostedInstance: true,
+    webexExecutablePathVerified: true,
+    webexAccessoriesHelper: false,
+    webexUiAutomationInspected: true,
+    webexMeetingControlsPresent: true,
+  });
+
+  const [first] = tracker.update([host('2954308')], { now: 1_000 });
+  const firstObservation = normalizeMeetingObservations([first])[0];
+  assert.equal(firstObservation.identityKey, 'webex:window:18760:2954308');
+
+  const [replacement] = tracker.update([host('3216452')], { now: 25_000 });
+  assert.equal(replacement.webexCanonicalWindowId, '2954308');
+  assert.equal(replacement.webexWindowIdentityChanged, true);
+
+  const replacementObservation = normalizeMeetingObservations([replacement])[0];
+  assert.equal(replacementObservation.identityKey, 'webex:window:18760:2954308');
+  assert.equal(replacementObservation.windowId, '3216452');
+  assert.ok(replacementObservation.evidence.some((item) => item.kind === 'webex_window_recreated'));
+
+  const [staleAfterTimeout] = tracker.update([{
+    ...host('3348120'),
+    webexUiAutomationInspected: false,
+    webexMeetingControlsPresent: true,
+    webexMeetingControlsStale: true,
+  }], { now: 30_000 });
+  const staleObservation = normalizeMeetingObservations([staleAfterTimeout])[0];
+  assert.equal(staleObservation.identityKey, 'webex:window:18760:2954308');
+  assert.equal(staleObservation.state, 'active');
+  assert.equal(staleObservation.windowId, '3348120');
 });

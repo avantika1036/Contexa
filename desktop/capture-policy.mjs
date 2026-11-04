@@ -1,8 +1,9 @@
 // Decides when automatic capture should stop, and when a just-ended window must not restart it.
 //
-// Window titles alone are unreliable: a browser reports only its active tab's title, Zoom has
-// several windows, and a "You left the meeting" page keeps matching after the call is over.
-// Audio activity is the stronger signal, so both are combined.
+// Window titles alone are unreliable: provider adapters only identify candidates.
+// Capture lifecycle decisions combine these observations with continuity and audio evidence.
+
+import { detectProviderWindow } from './providers/index.mjs';
 
 export const DEFAULT_POLICY = Object.freeze({
   stopAfterMissingMs: 15_000,        // meeting window not seen for this long...
@@ -12,77 +13,112 @@ export const DEFAULT_POLICY = Object.freeze({
   neverAudibleIdleMs: 600_000,       // ...but wait longer if nothing was ever heard (waiting alone)
 });
 
-const CAPTURED_PROCESS_NAMES = new Set([
-  'zoom', 'zoomworkplace', 'zoom meetings', 'ms-teams', 'teams', 'webex',
-  'ciscocollabhost', 'chrome', 'msedge', 'brave', 'firefox',
-]);
-
 /**
- * Return true only for a supported meeting window, not an ordinary app/browser window.
- * Google Meet's title commonly changes from the generic "Google Meet" during initial
- * loading to the stable "Meet - abc-defg-hij" form. The latter must remain detectable
- * after Electron restarts, otherwise the persisted suspended session is never reclaimed.
+ * Return true only when one provider-specific adapter recognizes this process/title pair.
+ * The adapters identify candidate windows; they do not decide whether a call is live.
  */
-export function isSupportedMeetingWindow(processName, title) {
-  const process = String(processName || '').toLowerCase().replace(/\.exe$/, '').trim();
-  const name = String(title || '').trim();
-  const lower = name.toLowerCase();
-  if (!name || !CAPTURED_PROCESS_NAMES.has(process)) return false;
-
-  if (['zoom', 'zoomworkplace', 'zoom meetings'].includes(process)) {
-    return /\bzoom\s+meeting\b|\bmeeting\b.*\bzoom\b|\bcall\b.*\bzoom\b|\bzoom\b.*\bcall\b/i.test(name)
-      && !/home|settings|contacts|chat|schedule/i.test(lower);
-  }
-  if (['ms-teams', 'teams'].includes(process)) {
-    return /\bmeeting\b|\bcall\b|\bhuddle\b/i.test(name)
-      && /teams|meeting|call|huddle/i.test(lower)
-      && !/settings|chat list|activity/i.test(lower);
-  }
-  if (['webex', 'ciscocollabhost'].includes(process)) {
-    return /\bmeeting\b|\bcall\b|\bwebex\b/i.test(name)
-      && !/home|settings|chat|calendar/i.test(lower);
-  }
-
-  // Include the explicit Google Meet call-code title. Keep the generic/provider URL
-  // patterns for compatibility with other browser meeting surfaces.
-  return /google meet|\bmeet\s*[-–|]\s*[a-z]{3}-[a-z]{4}-[a-z]{3}\b|meet\s*[-–|].*chrome|meet\s*[-–|].*edge|meet\.google|zoom meeting|zoom\.us.*meeting|meeting.*zoom|microsoft teams.*meeting|meeting.*microsoft teams|teams\.microsoft|webex.*meeting|meeting.*webex/i.test(name)
-    && !/settings|extensions|history|downloads/i.test(lower);
+export function isSupportedMeetingWindow(processName, title, metadata = {}) {
+  return Boolean(detectProviderWindow(processName, title, metadata));
 }
 
 /**
  * @returns {null | { reason: 'window-missing' | 'idle', missingForMs: number, quietForMs: number }}
  */
-export function captureStopReason({ now, startedAt, lastMatchedAt, lastAudibleAt, policy = {} }) {
+export function captureStopReason({ now, startedAt, lastMatchedAt, lastAudibleAt, lastMeetingAudioAt = lastAudibleAt, policy = {} }) {
   const p = { ...DEFAULT_POLICY, ...policy };
   const missingForMs = now - lastMatchedAt;
-  const quietForMs = now - (lastAudibleAt || startedAt);
+  // A microphone can remain active after the user leaves a call. It is not reliable
+  // evidence that the provider meeting itself is still live. Prefer application-side
+  // meeting audio for the lifecycle idle clock; retain lastAudibleAt as a fallback
+  // for older callers and tests.
+  const meetingAudioAt = Number(lastMeetingAudioAt) || 0;
+  const quietForMs = now - (meetingAudioAt || startedAt);
 
   if (missingForMs >= p.stopAfterMissingMs) {
     // While people are still talking, a flapping window title must not cut the meeting in two.
     const keptAliveByAudio = quietForMs < p.quietBeforeMissingStopMs && missingForMs < p.maxMissingWhileAudibleMs;
     if (!keptAliveByAudio) return { reason: 'window-missing', missingForMs, quietForMs };
   }
-  const heardAnything = Boolean(lastAudibleAt);
+  const heardAnything = Boolean(meetingAudioAt);
   const idleLimit = heardAnything ? p.idleEndMs : Math.max(p.idleEndMs, p.neverAudibleIdleMs);
   if (p.idleEndMs > 0 && quietForMs >= idleLimit) {
-    return { reason: 'idle', missingForMs, quietForMs };
+    return { reason: 'idle', missingForMs, quietForMs, activitySource: meetingAudioAt ? 'meeting-audio' : 'no-meeting-audio-observed' };
   }
   return null;
 }
 
 /**
- * After an idle stop the meeting page usually still matches ("You left the meeting"), so the
- * same window must not immediately start a new capture. The block lifts when that window
- * disappears (tab closed, new call) or after `until`.
+ * Select a new capture target only from foreground meetings. Background observations
+ * remain in the lifecycle registry, but should not start or resurrect capture by themselves.
+ * `blocks` accepts either the legacy single-block shape or the current array of blocks.
  */
-export function selectStartCandidate(matches, block, now, keyOf) {
-  let activeBlock = block;
-  if (activeBlock) {
-    const stillPresent = matches.some((m) => m.pid === activeBlock.pid && keyOf(m) === activeBlock.key);
-    if (!stillPresent || now >= activeBlock.until) activeBlock = null;
-  }
-  const candidate = matches.find((m) => !(activeBlock && m.pid === activeBlock.pid && keyOf(m) === activeBlock.key)) || null;
-  return { candidate, block: activeBlock };
+function normalizeRestartBlocks(value) {
+  if (Array.isArray(value)) return value.filter(Boolean);
+  return value && typeof value === 'object' ? [value] : [];
+}
+
+function isDurableKey(value) {
+  return /^(?:meet:[a-z]{3}-[a-z]{4}-[a-z]{3}|(?:zoom|teams|webex):id:\d{8,13}|webex:launch:[a-f0-9]{24}|webex:window:\d+:[A-Za-z0-9_-]{1,80}(?:-call\d+)?)$/i.test(String(value || ''));
+}
+
+function isRestartBlocked(row, blocks, now, keyOf) {
+  const pid = Number(row?.pid ?? row?.processId);
+  const provider = String(row?.provider || '').toLowerCase();
+  const key = String(keyOf(row) || '');
+  const windowId = String(row?.windowId || '');
+  return blocks.some((block) => {
+    if (now >= Number(block.until || 0)) return false;
+    if (block.provider && provider && provider !== String(block.provider).toLowerCase()) return false;
+
+    const blockedKey = String(block.key || '');
+    // A durable call ID identifies the meeting independently of its browser process
+    // or HWND. Check it before the PID/window fallback: Chrome can restart while the
+    // same Google Meet call is still open, producing a different PID and HWND.
+    if (key && key === blockedKey && isDurableKey(key)) return true;
+
+    // Non-durable keys (for example provider/title fallbacks) remain scoped to the
+    // original process. They must not suppress a different process that happens to
+    // show the same generic title.
+    if (pid !== Number(block.pid)) return false;
+    if (key && key === blockedKey) return true;
+    if (!block.windowId || !windowId || windowId !== String(block.windowId)) return false;
+    // A different explicit call ID in the same browser/native HWND is a new meeting.
+    if (isDurableKey(key) && isDurableKey(blockedKey) && key !== blockedKey) return false;
+    // Generic-title fallback on the same HWND still belongs to the explicitly-ended window.
+    return true;
+  });
+}
+
+function hasVerifiedActiveWebexDesktopEvidence(row) {
+  if (String(row?.provider || '').toLowerCase() !== 'webex') return false;
+  if (String(row?.source || '').toLowerCase() !== 'native_window') return false;
+  if (String(row?.state || '').toLowerCase() !== 'active' || row?.confidence !== 'high') return false;
+  if (!/^webex:window:\d+:[A-Za-z0-9_-]+$/i.test(String(row?.identityKey || ''))) return false;
+  return Array.isArray(row?.evidence) && row.evidence.some((item) =>
+    item?.kind === 'webex_accessibility' && item?.value === 'end-meeting-control-present'
+  );
+}
+
+export function selectStartCandidate(matches, blocks, now, keyOf) {
+  const rows = Array.isArray(matches) ? matches : [];
+  const activeBlocks = normalizeRestartBlocks(blocks).filter((block) => now < Number(block.until || 0));
+  const eligible = rows.filter((row) => {
+    const state = String(row?.state || '').toLowerCase();
+    if (['left', 'ended', 'temporarily_missing', 'unknown'].includes(state)) return false;
+    // Normal background windows must never steal the capture slot. Webex Desktop is
+    // the sole exception: an inspected `End meeting` accessibility control is direct
+    // evidence that a call is active, even while Contexa or another window has focus.
+    // Requiring its PID/HWND identity, source, state, confidence and evidence prevents
+    // an idle Webex Home window or an ordinary browser title from bypassing focus safety.
+    const verifiedBackgroundWebex = hasVerifiedActiveWebexDesktopEvidence(row);
+    if (row?.foreground !== true && row?.windowFocus !== 'foreground' && !verifiedBackgroundWebex) return false;
+    return !isRestartBlocked(row, activeBlocks, now, keyOf);
+  });
+  const candidate = eligible.sort((a, b) => {
+    const confidenceRank = (value) => value === 'high' ? 2 : value === 'medium' ? 1 : 0;
+    return confidenceRank(b.confidence) - confidenceRank(a.confidence);
+  })[0] || null;
+  return { candidate, block: activeBlocks, blocks: activeBlocks };
 }
 
 /**
@@ -113,12 +149,59 @@ export function normalizeDesktopWindows(rawWindows) {
         .trim()
         .slice(0, 180),
       foreground: Boolean(window.foreground),
+      foregroundProcessId: Number.isInteger(Number(window.foregroundProcessId)) ? Number(window.foregroundProcessId) : null,
+      foregroundWindowId: window.foregroundWindowId ? String(window.foregroundWindowId) : null,
+      // Sanitized native Webex process/accessibility evidence. Raw command lines,
+      // protocol URIs, join tokens and accessibility tree contents are never retained.
+      ...(window.webexHostedInstance === true ? { webexHostedInstance: true } : {}),
+      ...(window.webexExecutablePathVerified === true ? { webexExecutablePathVerified: true } : {}),
+      ...(window.webexAccessoriesHelper === true ? { webexAccessoriesHelper: true } : {}),
+      ...(window.webexUiAutomationInspected === true ? { webexUiAutomationInspected: true } : {}),
+      ...(typeof window.webexUiAutomationError === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(window.webexUiAutomationError)
+        ? { webexUiAutomationError: window.webexUiAutomationError }
+        : {}),
+      ...(window.webexMeetingControlsPresent === true
+        && (window.webexUiAutomationInspected === true || window.webexMeetingControlsStale === true)
+        ? { webexMeetingControlsPresent: true }
+        : {}),
+      ...(window.webexMeetingControlsStale === true ? { webexMeetingControlsStale: true } : {}),
+      ...(window.webexCanonicalWindowId && /^[A-Za-z0-9_-]{1,80}$/.test(String(window.webexCanonicalWindowId))
+        ? { webexCanonicalWindowId: String(window.webexCanonicalWindowId) }
+        : {}),
+      ...(Number.isInteger(Number(window.webexCallEpoch)) && Number(window.webexCallEpoch) > 0
+        ? { webexCallEpoch: Number(window.webexCallEpoch) }
+        : {}),
+      ...(window.webexWindowIdentityChanged === true ? { webexWindowIdentityChanged: true } : {}),
+      ...(window.webexMeetingEnded === true ? { webexMeetingEnded: true } : {}),
     }))
     .sort((left, right) => Number(right.foreground) - Number(left.foreground));
 }
 
 /** Meeting-only view used when selecting new sessions and resolving stable call IDs. */
 export function normalizeMeetingWindows(rawWindows) {
-  return normalizeDesktopWindows(rawWindows)
-    .filter((window) => isSupportedMeetingWindow(window.processName, window.title));
+  const windows = normalizeDesktopWindows(rawWindows);
+  const supported = windows.filter((window) => isSupportedMeetingWindow(window.processName, window.title, window));
+
+  // Some Chromium/Teams builds return a focused child/owned HWND that does not match
+  // the top-level HWND returned by EnumWindows. The snapshot includes the foreground
+  // PID and root HWND. Prefer exact HWND evidence; only fall back to PID when exactly
+  // one supported meeting window belongs to that foreground process. This avoids
+  // promoting multiple background calls in the same Chrome process.
+  if (!supported.some((window) => window.foreground)) {
+    const foregroundRow = windows.find((window) => Number(window.foregroundProcessId) > 0);
+    const foregroundPid = foregroundRow?.foregroundProcessId;
+    const foregroundRootKnown = Boolean(foregroundRow?.foregroundWindowId)
+      && windows.some((window) => window.windowId === foregroundRow.foregroundWindowId);
+    if (foregroundPid && !foregroundRootKnown) {
+      const sameProcessWindows = windows.filter((window) => window.pid === foregroundPid);
+      const foregroundCandidates = supported.filter((window) => window.pid === foregroundPid);
+      // PID fallback is safe only when there is one top-level window in the process.
+      // If multiple browser windows share the PID, require the exact foreground HWND.
+      if (sameProcessWindows.length === 1 && foregroundCandidates.length === 1) {
+        foregroundCandidates[0].foreground = true;
+      }
+    }
+  }
+
+  return supported.sort((left, right) => Number(right.foreground) - Number(left.foreground));
 }

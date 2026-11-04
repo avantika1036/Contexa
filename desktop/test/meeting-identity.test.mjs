@@ -14,7 +14,7 @@ test('waits briefly for Google Meet to expose its durable call code before creat
   const resolved = await resolveStableMeetingWindow({
     initialWindow: generic,
     keyOf,
-    timeoutMs: 30,
+    timeoutMs: 250,
     pollMs: 1,
     sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     getWindows: async () => {

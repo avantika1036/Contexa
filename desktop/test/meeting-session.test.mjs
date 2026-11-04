@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyWindowTransition, isDurableMeetingKey, meetingKey, SessionContinuity, hasSameBrowserProcessWindow, shouldKeepBrowserCaptureDuringTabSwitch } from '../meeting-session.mjs';
+import { classifyWindowTransition, isDurableMeetingKey, meetingKey, meetingCaptureKey, SessionContinuity, hasSameBrowserProcessWindow, shouldKeepBrowserCaptureDuringTabSwitch } from '../meeting-session.mjs';
 
 test('a Google Meet code gives the same key regardless of tab title noise or browser', () => {
   const a = meetingKey('chrome', '(2) Meet - abc-defg-hij - Google Chrome');
@@ -217,4 +217,147 @@ test('the browser continuity fallback applies only to an unverified/missing tran
   assert.equal(shouldKeepBrowserCaptureDuringTabSwitch('different-meeting', sameProcessOtherTab, current), false);
   assert.equal(shouldKeepBrowserCaptureDuringTabSwitch('same-window', sameProcessOtherTab, current), false);
   assert.equal(shouldKeepBrowserCaptureDuringTabSwitch('missing', [], current), false);
+});
+
+
+test('an explicit left/ended observation ends the matching active meeting before same-window continuity', () => {
+  const current = {
+    processId: 4242, processName: 'chrome', provider: 'google_meet',
+    sessionKey: 'meet:abc-defg-hij',
+  };
+  const ended = {
+    pid: 4242, processName: 'chrome', provider: 'google_meet',
+    title: 'Meet - abc-defg-hij', state: 'left',
+  };
+  assert.equal(classifyWindowTransition([ended], current).type, 'meeting-ended');
+});
+
+test('a generic terminal surface is accepted only when one same-provider window is unambiguous', () => {
+  const current = {
+    processId: 4242, processName: 'chrome', provider: 'google_meet',
+    sessionKey: 'meet:abc-defg-hij',
+  };
+  const ended = { pid: 4242, processName: 'chrome', provider: 'google_meet', title: 'Google Meet', state: 'ended' };
+  assert.equal(classifyWindowTransition([ended], current).type, 'meeting-ended');
+  const secondCall = { ...ended, title: 'Meet - zzz-zzzz-zzz', state: 'candidate' };
+  const result = classifyWindowTransition([ended, secondCall], current);
+  assert.equal(result.type, 'different-meeting');
+  assert.equal(result.window, secondCall);
+});
+
+test('an explicit terminal state on the captured HWND wins even when another same-provider call is visible', () => {
+  const current = {
+    processId: 4242, processName: 'chrome', provider: 'google_meet',
+    sessionKey: 'meet:abc-defg-hij', windowId: '1001',
+  };
+  const ended = {
+    pid: 4242, processName: 'chrome', provider: 'google_meet',
+    title: 'Google Meet', state: 'left', windowId: '1001',
+  };
+  const otherCall = {
+    pid: 4242, processName: 'chrome', provider: 'google_meet',
+    title: 'Meet - zzz-zzzz-zzz', state: 'candidate', windowId: '1002',
+  };
+  const result = classifyWindowTransition([ended, otherCall], current);
+  assert.equal(result.type, 'meeting-ended');
+  assert.equal(result.window, ended);
+});
+
+
+test('native Zoom recovery key is stable across descriptive-title to generic-title changes on the same HWND', () => {
+  const first = {
+    provider: 'zoom', source: 'native_window', pid: 34404, processId: 34404,
+    windowId: '50122', processName: 'Zoom', identityKey: "zoom:avantika pandey's zoom meeting",
+    title: "Avantika Pandey's Zoom Meeting",
+  };
+  const afterRestart = {
+    provider: 'zoom', source: 'native_window', pid: 34404, processId: 34404,
+    windowId: '50122', processName: 'Zoom', identityKey: 'zoom:*', title: 'Zoom Meeting',
+  };
+  assert.equal(meetingCaptureKey(first), 'zoom:window:34404:50122');
+  assert.equal(meetingCaptureKey(afterRestart), meetingCaptureKey(first));
+  assert.equal(isDurableMeetingKey(meetingCaptureKey(first)), true);
+});
+
+test('native Zoom meeting title fallback on same HWND remains the same in-process window', () => {
+  const current = {
+    processId: 34404, processName: 'Zoom', provider: 'zoom',
+    sessionKey: "zoom:avantika pandey's zoom meeting", windowId: '50122',
+  };
+  const generic = {
+    pid: 34404, processName: 'Zoom', provider: 'zoom', source: 'native_window',
+    identityKey: 'zoom:*', title: 'Zoom Meeting', windowId: '50122', foreground: true,
+  };
+  assert.equal(classifyWindowTransition([generic], current).type, 'same-window');
+});
+
+
+test('Webex replacement HWND with the same canonical call identity continues the current capture', () => {
+  const current = {
+    processId: 18760,
+    processName: 'CiscoCollabHost',
+    provider: 'webex',
+    sessionKey: 'webex:window:18760:3413572',
+    windowId: '3413572',
+  };
+  const replacement = {
+    pid: 18760,
+    processName: 'CiscoCollabHost',
+    provider: 'webex',
+    source: 'native_window',
+    identityKey: 'webex:window:18760:3413572',
+    windowId: '3348120',
+    state: 'active',
+    foreground: false,
+  };
+  const transition = classifyWindowTransition([replacement], current);
+  assert.equal(transition.type, 'same-window');
+  assert.equal(transition.window.windowId, '3348120');
+});
+
+test('a new Webex call epoch after an observed end is classified as a different meeting', () => {
+  const current = {
+    processId: 18760,
+    processName: 'CiscoCollabHost',
+    provider: 'webex',
+    sessionKey: 'webex:window:18760:3413572',
+    windowId: '3413572',
+  };
+  const nextCall = {
+    pid: 18760,
+    processName: 'CiscoCollabHost',
+    provider: 'webex',
+    source: 'native_window',
+    identityKey: 'webex:window:18760:3348120-call2',
+    windowId: '3348120',
+    state: 'active',
+    foreground: true,
+  };
+  const transition = classifyWindowTransition([nextCall], current);
+  assert.equal(transition.type, 'different-meeting');
+});
+
+test('Webex HWND recreation keeps the same backend recovery capture key', () => {
+  const before = {
+    provider: 'webex', source: 'native_window', pid: 18760, processId: 18760,
+    processName: 'CiscoCollabHost', windowId: '3413572',
+    identityKey: 'webex:window:18760:3413572',
+  };
+  const after = {
+    ...before,
+    windowId: '3348120',
+  };
+  assert.equal(meetingCaptureKey(before), 'webex:window:18760:3413572');
+  assert.equal(meetingCaptureKey(after), meetingCaptureKey(before));
+});
+
+
+test('Webex call-epoch recovery keys remain durable and distinct after a confirmed end', () => {
+  const newCall = {
+    provider: 'webex', source: 'native_window', pid: 18760, processId: 18760,
+    processName: 'CiscoCollabHost', windowId: '3348120',
+    identityKey: 'webex:window:18760:3348120-call2',
+  };
+  assert.equal(isDurableMeetingKey(newCall.identityKey), true);
+  assert.equal(meetingCaptureKey(newCall), 'webex:window:18760:3348120-call2');
 });

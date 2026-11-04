@@ -10,11 +10,15 @@ import WebSocket from 'ws';
 import loopback from 'loopback-capture';
 import mic, { devices as listMicrophoneDevices } from '@audio/mic';
 import { startUiServer } from './ui-server.mjs';
-import { meetingKey, classifyWindowTransition, SessionContinuity, graceForKey, shouldKeepBrowserCaptureDuringTabSwitch } from './meeting-session.mjs';
+import { meetingKey, meetingCaptureKey, classifyWindowTransition, SessionContinuity, graceForKey, shouldKeepBrowserCaptureDuringTabSwitch } from './meeting-session.mjs';
 import { createMeetingSession, resumeMeetingSession, suspendMeetingSession, upgradeMeetingIdentitySession } from './meeting-api.mjs';
 import { pumpReader } from './mic-reader.mjs';
 import { selectMicrophoneDevice, isRecoverableMicrophoneDeviceError, microphoneRetryDelayMs, waitForStableMicrophoneDevice } from './microphone-devices.mjs';
-import { captureStopReason, selectStartCandidate, resolveAutoCapture, normalizeDesktopWindows, normalizeMeetingWindows } from './capture-policy.mjs';
+import { captureStopReason, selectStartCandidate, resolveAutoCapture, normalizeDesktopWindows } from './capture-policy.mjs';
+import { planAutoCaptureEnd, addRestartBlock, reconcileRestartBlocks, CrossProviderHandoffTracker } from './meeting-control.mjs';
+import { normalizeMeetingObservations, markActiveMeetingObservations } from './meeting-observation.mjs';
+import { MeetingLifecycleRegistry, lifecycleEventMatchesRestartBlock } from './meeting-lifecycle.mjs';
+import { WebexMeetingControlTracker } from './webex-meeting-controls.mjs';
 import { FramePacer } from './frame-pacer.mjs';
 import { SampleQueue } from './sample-queue.mjs';
 import { measurePcm16StereoChannel, isPcmChannelActive } from './audio-meter.mjs';
@@ -45,6 +49,7 @@ const IDLE_RESTART_BLOCK_MS = Math.max(0, Number(process.env.CONTEXA_IDLE_RESTAR
 // Zoom/Teams/Webex windows closing normally means the call is over, so those end sooner.
 const NATIVE_SESSION_GRACE_MS = Math.max(0, Number(process.env.CONTEXA_NATIVE_SESSION_GRACE_SECONDS ?? 60)) * 1000;
 const CAPTURE_POLICY = { stopAfterMissingMs: STOP_AFTER_MISSING_MS, idleEndMs: IDLE_END_MS };
+const CROSS_PROVIDER_HANDOFF_QUIET_MS = Math.max(5, Number(process.env.CONTEXA_CROSS_PROVIDER_HANDOFF_QUIET_SECONDS || 30)) * 1000;
 const SESSION_GRACE_MS = Math.max(0, Number(process.env.CONTEXA_SESSION_GRACE_SECONDS || 300)) * 1000;
 const PCM_RATE = 48000;
 const OUTPUT_FRAME_MS = 100;
@@ -60,6 +65,7 @@ let shutdownComplete = false;
 let settings = { autoCaptureEnabled: false, consentVersion: 0, firstRunPromptSeen: false, autoCapturePausedByUser: false };
 let currentCapture = null;
 let monitorTimer = null;
+let sessionCleanupTimer = null;
 let monitorInFlight = false;
 let lastCaptureError = '';
 let lastStartAttemptKey = '';
@@ -68,9 +74,19 @@ let serviceBootstrapPromise = null;
 let migrationPromise = null;
 let migrationsApplied = false;
 const continuity = new SessionContinuity({ graceMs: SESSION_GRACE_MS });
+// Tracks observations for every detected meeting, even while one audio stream is active.
+const lifecycleRegistry = new MeetingLifecycleRegistry({ missingGraceMs: 30_000, retentionMs: 15 * 60_000 });
+const crossProviderHandoff = new CrossProviderHandoffTracker({ quietMs: CROSS_PROVIDER_HANDOFF_QUIET_MS, confirmations: 2, candidateWindowMs: 15_000 });
+const WEBEX_WINDOW_ABSENCE_GRACE_MS = Math.max(10, Number(process.env.CONTEXA_WEBEX_WINDOW_ABSENCE_SECONDS || 20)) * 1000;
+const webexMeetingControlTracker = new WebexMeetingControlTracker({ missedPollsToEnd: 2, windowAbsenceGraceMs: WEBEX_WINDOW_ABSENCE_GRACE_MS });
+const webexUiaCacheByPid = new Map();
+const WEBEX_UIA_CACHE_MS = 12_000;
+const WEBEX_UIA_STALE_ON_ERROR_MS = 60_000;
 let finalizeTimer = null;
-let restartBlock = null;
+let restartBlocks = [];
 let lastMeetingWindowSnapshot = '';
+let lastWebexAccessibilitySnapshot = '';
+let lastWebexWindowRecreationSnapshot = '';
 let lastMonitorError = '';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -296,14 +312,20 @@ async function openMainWindow() {
 
 function startMonitoring() {
   if (monitorTimer) clearInterval(monitorTimer);
+  if (sessionCleanupTimer) clearInterval(sessionCleanupTimer);
   if (!settings.autoCaptureEnabled) return;
   monitorTimer = setInterval(() => void monitorMeetingWindows(), POLL_MS);
+  // Reconcile orphaned desktop-auto history rows as the app runs, not just at startup.
+  // The API protects sessions with a live WebSocket/audio stream.
+  sessionCleanupTimer = setInterval(() => void runSessionCleanup(), 60_000);
   void monitorMeetingWindows();
 }
 
 function stopMonitoring() {
   if (monitorTimer) clearInterval(monitorTimer);
+  if (sessionCleanupTimer) clearInterval(sessionCleanupTimer);
   monitorTimer = null;
+  sessionCleanupTimer = null;
 }
 
 function settingsPath() {
@@ -333,82 +355,177 @@ function setStartupEnabled(enabled) {
   });
 }
 
-async function getDesktopWindowSnapshot() {
-  // Enumerate actual top-level HWNDs rather than using Get-Process.MainWindowTitle.
-  // Chrome/Edge can have several browser windows in one process; MainWindowTitle only
-  // represents one of them, which can make an open Meet disappear from the detector.
-  const script = String.raw`
-$ErrorActionPreference = 'SilentlyContinue'
-Add-Type @'
-using System;
-using System.Text;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-public static class ContexaWindowEnumerator {
-  public sealed class WindowInfo {
-    public int pid { get; set; }
-    public string processName { get; set; }
-    public string title { get; set; }
-    public bool foreground { get; set; }
-  }
-  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr hWnd);
-  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  public static List<WindowInfo> GetWindows() {
-    var rows = new List<WindowInfo>();
-    IntPtr foregroundHandle = GetForegroundWindow();
-    EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
-      if (!IsWindowVisible(hWnd)) return true;
-      int length = GetWindowTextLength(hWnd);
-      if (length <= 0) return true;
-      var title = new StringBuilder(length + 1);
-      GetWindowText(hWnd, title, title.Capacity);
-      if (title.Length == 0) return true;
-      uint processId;
-      GetWindowThreadProcessId(hWnd, out processId);
-      try {
-        using (var process = Process.GetProcessById((int)processId)) {
-          rows.Add(new WindowInfo {
-            pid = (int)processId,
-            processName = process.ProcessName,
-            title = title.ToString(),
-            foreground = hWnd == foregroundHandle
-          });
-        }
-      } catch { }
-      return true;
-    }, IntPtr.Zero);
-    return rows;
-  }
+function summarizePowerShellFailure(error) {
+  const raw = [error?.stderr, error?.stdout].map((value) => String(value || '').trim()).filter(Boolean).join('\n');
+  const lines = raw.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/CommandLine|webex:\/\/|joinTXId|protocolUri/i.test(line))
+    .slice(-4);
+  const detail = lines.join(' | ').replace(/(?:[A-Z]:\\[^\s:]+)+/gi, '<path>').slice(0, 360);
+  const code = error?.code ?? error?.signal ?? 'unknown';
+  return detail ? `exit=${code}: ${detail}` : `exit=${code}`;
 }
-'@
-$rows = [ContexaWindowEnumerator]::GetWindows()
-ConvertTo-Json -InputObject @($rows) -Compress
-`;
+
+async function runPowerShellJson(scriptPath, args = [], timeoutMs = 5000) {
+  let stdout;
   try {
-    const { stdout } = await execFileAsync('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-    ], { windowsHide: true, timeout: 7000, maxBuffer: 2 * 1024 * 1024 });
-    const content = stdout.trim();
-    if (!content) return [];
-    return normalizeDesktopWindows(JSON.parse(content));
+    ({ stdout } = await execFileAsync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args,
+    ], { windowsHide: true, timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024 }));
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (message !== lastCaptureError) {
-      console.error('Could not inspect meeting windows:', message);
-      lastCaptureError = message;
-    }
-    return [];
+    throw new Error(`PowerShell helper failed (${path.basename(scriptPath)}): ${summarizePowerShellFailure(error)}`);
+  }
+
+  const content = String(stdout || '').trim();
+  if (!content) throw new Error(`${path.basename(scriptPath)} returned no JSON output.`);
+  try {
+    return JSON.parse(content);
+  } catch (error) {
+    throw new Error(`${path.basename(scriptPath)} returned invalid JSON (${error instanceof Error ? error.message : 'parse error'}).`);
   }
 }
 
+async function getDesktopWindowSnapshot() {
+  // Ordinary window enumeration must never depend on Webex UI Automation. If the
+  // Webex COM/UIA probe fails, Google Meet/Zoom/Teams/browser detection still gets
+  // a complete HWND snapshot for this poll.
+  const basicSnapshotScript = path.join(__dirname, 'windows-window-snapshot.ps1');
+  const webexUiaScript = path.join(__dirname, 'webex-uia-snapshot.ps1');
+  let normalized;
+  try {
+    const rawWindows = await runPowerShellJson(basicSnapshotScript, [], 5000);
+    normalized = normalizeDesktopWindows(rawWindows);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const diagnostic = message.split('\n')[0].replace(/(?:[A-Z]:\\[^\s:]+)+/gi, '<path>').slice(0, 240);
+    if (diagnostic !== lastCaptureError) {
+      lastCaptureError = diagnostic;
+      console.error(`[Meeting detector] basic Windows snapshot failed: ${diagnostic}`);
+    }
+    return [];
+  }
+
+  const webexHostRows = normalized.filter((row) =>
+    String(row.processName || '').toLowerCase().replace(/\.exe$/, '') === 'ciscocollabhost'
+      && String(row.title || '').trim().toLowerCase() === 'webex'
+  );
+  const webexPids = [...new Set(webexHostRows.map((row) => Number(row.pid)).filter((pid) => Number.isInteger(pid) && pid > 0))];
+  const presentWebexPids = new Set(webexPids);
+  // Never carry a positive UIA result across a complete top-level-window absence.
+  // A recreated HWND must receive a fresh probe before it can reset the absence timer.
+  for (const cachedPid of webexUiaCacheByPid.keys()) {
+    if (!presentWebexPids.has(cachedPid)) webexUiaCacheByPid.delete(cachedPid);
+  }
+  const webexMetadataByPid = new Map();
+
+  for (const pid of webexPids) {
+    const now = Date.now();
+    const cached = webexUiaCacheByPid.get(pid);
+    if (cached && now - cached.checkedAt < WEBEX_UIA_CACHE_MS) {
+      webexMetadataByPid.set(pid, cached.result);
+      continue;
+    }
+    try {
+      // The helper now searches only the Webex top-level window and the four meeting
+      // control names. Keep a bounded timeout, and reuse the last successful result
+      // briefly if the process/UIA provider stalls during a transition.
+      const result = await runPowerShellJson(webexUiaScript, ['-TargetPid', String(pid)], 20_000);
+      if (result && typeof result === 'object' && result.inspected === true) {
+        if (result.meetingControlsPresent === true) {
+          // Cache positive evidence briefly to avoid launching another STA helper on
+          // every 2.5s poll. Do not cache an inspected absence: each debounce miss must
+          // come from a distinct live UIA query, not replayed cached data.
+          // Start the cache lifetime after the slow UIA process completes, not
+          // before it launches. Webex probes can take ~10 seconds on this client.
+          webexUiaCacheByPid.set(pid, { checkedAt: Date.now(), result });
+        } else {
+          webexUiaCacheByPid.delete(pid);
+        }
+        webexMetadataByPid.set(pid, result);
+      } else if (cached && Date.now() - cached.checkedAt < WEBEX_UIA_STALE_ON_ERROR_MS
+        && cached.result?.meetingControlsPresent === true) {
+        // An explicit `inspected:false` JSON response is still an unknown result.
+        // Preserve the last active proof as stale rather than replaying it as a
+        // fresh successful positive UIA scan.
+        webexMetadataByPid.set(pid, {
+          ...cached.result,
+          inspected: false,
+          meetingControlsPresent: true,
+          stalePositive: true,
+          error: result?.error || 'uia-inspection-unavailable',
+        });
+      } else {
+        webexMetadataByPid.set(pid, result && typeof result === 'object' ? result : { inspected: false, error: 'invalid-result' });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const diagnostic = message.split('\n')[0].replace(/(?:[A-Z]:\\[^\s:]+)+/gi, '<path>').slice(0, 360);
+      const cachedAgeMs = cached ? Date.now() - cached.checkedAt : Number.POSITIVE_INFINITY;
+      if (cached && cachedAgeMs < WEBEX_UIA_STALE_ON_ERROR_MS && cached.result?.meetingControlsPresent === true) {
+        // A timed-out helper is unknown, not a negative scan. Carry forward the
+        // last verified host identity and positive controls as explicitly stale
+        // evidence. The tracker will keep the current call identity but will not
+        // count this as a fresh successful scan or as evidence that the call ended.
+        webexMetadataByPid.set(pid, {
+          ...cached.result,
+          inspected: false,
+          meetingControlsPresent: true,
+          stalePositive: true,
+          error: 'uia-process-failed',
+        });
+      } else {
+        webexMetadataByPid.set(pid, { inspected: false, error: 'uia-process-failed' });
+      }
+      if (diagnostic !== lastCaptureError) {
+        lastCaptureError = diagnostic;
+        console.warn(`[Webex desktop] UI Automation probe failed for PID ${pid}; using a recent successful result when available: ${diagnostic}`);
+      }
+    }
+  }
+
+  const enriched = normalized.map((row) => {
+    const metadata = webexMetadataByPid.get(Number(row.pid));
+    if (!metadata || String(row.processName || '').toLowerCase().replace(/\.exe$/, '') !== 'ciscocollabhost'
+      || String(row.title || '').trim().toLowerCase() !== 'webex') return row;
+    return {
+      ...row,
+      ...(metadata.hostedInstance === true ? { webexHostedInstance: true } : {}),
+      ...(metadata.executablePathVerified === true ? { webexExecutablePathVerified: true } : {}),
+      ...(metadata.accessoriesHelper === true ? { webexAccessoriesHelper: true } : {}),
+      ...(metadata.inspected === true ? { webexUiAutomationInspected: true } : {}),
+      ...(metadata.meetingControlsPresent === true ? { webexMeetingControlsPresent: true } : {}),
+      ...(metadata.stalePositive === true ? { webexMeetingControlsStale: true } : {}),
+      ...(typeof metadata.error === 'string' ? { webexUiAutomationError: metadata.error } : {}),
+      ...(Number.isFinite(Number(metadata.elapsedMs)) ? { webexUiAutomationElapsedMs: Number(metadata.elapsedMs) } : {}),
+    };
+  });
+
+  const webexDiagnostic = enriched
+    .filter((row) => String(row.processName || '').toLowerCase().replace(/\.exe$/, '') === 'ciscocollabhost' && row.title.toLowerCase() === 'webex')
+    .map((row) => {
+      const status = row.webexUiAutomationInspected === true ? 'available' : 'unavailable';
+      const controls = row.webexMeetingControlsPresent === true ? 'present' : 'absent';
+      const reason = row.webexUiAutomationError ? `:${row.webexUiAutomationError}` : '';
+      const elapsed = Number.isFinite(Number(row.webexUiAutomationElapsedMs)) ? `:${row.webexUiAutomationElapsedMs}ms` : '';
+      return `pid=${row.pid}:uia=${status}:meeting-controls=${controls}${reason}${elapsed}`;
+    })
+    .sort()
+    .join(' | ');
+  if (webexDiagnostic !== lastWebexAccessibilitySnapshot) {
+    lastWebexAccessibilitySnapshot = webexDiagnostic;
+    console.info(`[Webex desktop] accessibility evidence: ${webexDiagnostic || 'no verified CiscoCollabHost Webex window'}`);
+  }
+
+  const tracked = webexMeetingControlTracker.update(enriched, { now: Date.now() });
+  for (const event of webexMeetingControlTracker.consumeEvents()) {
+    console.info(`[Webex desktop] no verified Webex host window for ${Math.round(event.missingForMs / 1000)}s; ending call identity webex:window:${event.pid}:${event.canonicalWindowId}${event.callEpoch > 1 ? `-call${event.callEpoch}` : ''}. A subsequent call in this process will receive a new epoch.`);
+  }
+  return tracked;
+}
+
 async function getMeetingWindows() {
-  return normalizeMeetingWindows(await getDesktopWindowSnapshot());
+  return normalizeMeetingObservations(await getDesktopWindowSnapshot());
 }
 
 function stereoPcmToMono(buffer) {
@@ -496,15 +613,18 @@ function deferSessionEnd({ meetingId, key, title, pid = null }) {
 
 async function runSessionCleanup() {
   try {
-    const response = await fetch(`${API_BASE}/api/meetings/cleanup`, { method: 'POST', signal: AbortSignal.timeout(8000) });
+    const response = await fetch(`${API_BASE}/api/meetings/cleanup?auto_idle_minutes=5`, { method: 'POST', signal: AbortSignal.timeout(8000) });
     if (response.ok) console.info('Session cleanup:', JSON.stringify(await response.json()));
   } catch (error) {
     console.warn('Session cleanup skipped:', error?.message || error);
   }
 }
 
-async function createMeeting(title, sessionKey, processName) {
-  const meeting = await createMeetingSession({ apiBase: API_BASE, title, sessionKey, processName });
+async function createMeeting(title, sessionKey, processName, captureKey = sessionKey) {
+  const meeting = await createMeetingSession({ apiBase: API_BASE, title, sessionKey, captureKey, processName });
+  if (captureKey && captureKey !== sessionKey) {
+    console.info(`[Meeting session] backend ${meeting.reused_by_server ? 'reused' : 'created'} session=${meeting.id} using recoveryKey=${captureKey}`);
+  }
   if (meeting.durable_identity_fallback) {
     const warning = 'The running FastAPI process does not expose /api/meetings/auto (HTTP 404/405). Contexa created a compatibility session so capture can continue, but database-backed duplicate prevention is unavailable until the older backend process is stopped and Contexa is restarted.';
     console.warn(warning);
@@ -550,14 +670,18 @@ function waitForTranscriptionReady(socket) {
 
 async function startCaptureForWindow(windowInfo) {
   if (currentCapture) return;
-  const initialKey = meetingKey(windowInfo.processName, windowInfo.title);
+  const initialKey = windowInfo.identityKey || meetingKey(windowInfo.processName, windowInfo.title);
   windowInfo = await resolveStableMeetingWindow({
     initialWindow: windowInfo,
     getWindows: getMeetingWindows,
-    keyOf: (candidate) => meetingKey(candidate.processName, candidate.title),
+    keyOf: (candidate) => candidate.identityKey || meetingKey(candidate.processName, candidate.title),
   });
   const title = windowInfo.title || `${windowInfo.processName} meeting`;
-  const sessionKey = meetingKey(windowInfo.processName, title);
+  const sessionKey = windowInfo.identityKey || meetingKey(windowInfo.processName, title);
+  const captureKey = meetingCaptureKey(windowInfo);
+  if (['zoom', 'teams', 'webex'].includes(String(windowInfo.provider || '').toLowerCase())) {
+    console.info(`[Meeting session] provider=${windowInfo.provider} process=${windowInfo.pid} window=${windowInfo.windowId || 'unavailable'} semanticKey=${sessionKey} recoveryKey=${captureKey || 'unavailable'}`);
+  }
   if (initialKey !== sessionKey) {
     console.info(`Resolved Google Meet call identity before creating the session: ${initialKey} -> ${sessionKey}.`);
   }
@@ -585,6 +709,7 @@ async function startCaptureForWindow(windowInfo) {
   const audioStats = {
     forwardedFrames: 0, suppressedSilentFrames: 0, appActiveFrames: 0, micActiveFrames: 0,
     micBacklogMs: 0, micDroppedMs: 0, appDroppedMs: 0, lastAudibleAt: 0,
+    lastMeetingAudioAt: 0, lastMicAudibleAt: 0,
     lastMicRms: 0, lastMicPeak: 0, maxMicRms: 0, maxMicPeak: 0,
     lastAppRms: 0, lastAppPeak: 0, maxAppRms: 0, maxAppPeak: 0,
   };
@@ -802,13 +927,13 @@ Transcription continues in the current meeting session.` });
       } catch (resumeError) {
         if (![404, 409].includes(resumeError?.status)) throw resumeError;
         console.warn(`The deferred session ${claimed.meetingId} is no longer resumable; obtaining a valid session for ${sessionKey}.`);
-        meeting = await createMeeting(title, sessionKey, windowInfo.processName);
+        meeting = await createMeeting(title, sessionKey, windowInfo.processName, captureKey);
         reusedSession = Boolean(meeting.reused_by_server);
       }
     } else {
       // A different meeting is starting: close whatever was waiting, then start fresh.
       await finalizePendingSession('a different meeting started');
-      meeting = await createMeeting(title, sessionKey, windowInfo.processName);
+      meeting = await createMeeting(title, sessionKey, windowInfo.processName, captureKey);
       reusedSession = Boolean(meeting.reused_by_server);
       if (reusedSession) {
         console.info(`The backend returned existing active session ${meeting.id} for stable meeting identity ${sessionKey}.`);
@@ -905,9 +1030,12 @@ Transcription continues in the current meeting session.` });
         lastAudioMeterLogAt = meterNow;
         console.info(`[${title}] Audio input meter (no audio content logged): mic_rms=${micLevel.rms} mic_peak=${micLevel.peak} mic_max_rms=${audioStats.maxMicRms} mic_max_peak=${audioStats.maxMicPeak} mic_gate_active=${micActive} app_rms=${appLevel.rms} app_peak=${appLevel.peak} app_gate_active=${appActive} mic_backlog_ms=${Math.round((micQueue.totalSamples / PCM_RATE) * 1000)}`);
       }
+      const activityAt = Date.now();
+      if (appActive) audioStats.lastMeetingAudioAt = activityAt;
+      if (micActive) audioStats.lastMicAudibleAt = activityAt;
       if (appActive || micActive) {
         framesSinceAudible = 0;
-        audioStats.lastAudibleAt = Date.now();
+        audioStats.lastAudibleAt = activityAt;
       } else {
         framesSinceAudible += 1;
       }
@@ -946,8 +1074,11 @@ Transcription continues in the current meeting session.` });
     currentCapture = {
       meetingId: meeting.id,
       sessionKey,
+      captureKey,
+      provider: windowInfo.provider || null,
       title,
       processId: windowInfo.pid,
+      windowId: windowInfo.windowId || null,
       processName: windowInfo.processName,
       startedAt: Date.now(),
       lastMatchedAt: Date.now(),
@@ -992,7 +1123,7 @@ Transcription continues in the current meeting session.` });
   }
 }
 
-async function stopCapture(reason = 'Meeting window disappeared', { endNow = false, suspendOnly = false } = {}) {
+async function stopCapture(reason = 'Meeting window disappeared', { endNow = false, suspendOnly = false, persistSession = true } = {}) {
   const capture = currentCapture;
   if (!capture || capture.stopping) return;
   capture.stopping = true;
@@ -1043,12 +1174,17 @@ async function stopCapture(reason = 'Meeting window disappeared', { endNow = fal
   }
 
   await sleep(500);
-  if (endNow) {
-    await endMeetingSession(capture.meetingId, { discardIfEmpty: true });
-  } else {
-    await suspendMeeting(capture.meetingId);
-    if (!suspendOnly) {
-      deferSessionEnd({ meetingId: capture.meetingId, key: capture.sessionKey, title: capture.title, pid: capture.processId });
+  if (persistSession) {
+    if (endNow) {
+      await endMeetingSession(capture.meetingId, { discardIfEmpty: true });
+    } else {
+      const suspended = await suspendMeeting(capture.meetingId);
+      if (suspended) {
+        console.info(`[Meeting session] suspended meeting=${capture.meetingId} recoveryKey=${capture.captureKey || 'unavailable'}`);
+      }
+      if (!suspendOnly) {
+        deferSessionEnd({ meetingId: capture.meetingId, key: capture.sessionKey, title: capture.title, pid: capture.processId });
+      }
     }
   }
   console.info(`Automatic meeting capture stopped: ${capture.title}. Reason: ${reason}. Audio stats: ${JSON.stringify(capture.audioStats || {})}`);
@@ -1060,12 +1196,58 @@ async function monitorMeetingWindows() {
   monitorInFlight = true;
   try {
     const desktopWindows = await getDesktopWindowSnapshot();
-    const matches = normalizeMeetingWindows(desktopWindows);
+    restartBlocks = reconcileRestartBlocks(restartBlocks, desktopWindows, Date.now());
+    const detectedObservations = normalizeMeetingObservations(desktopWindows);
+    const activeObservations = markActiveMeetingObservations(detectedObservations, currentCapture);
+    const lifecycle = lifecycleRegistry.update(activeObservations, { now: Date.now() });
+    const matches = lifecycle.observations;
     lastMonitorError = '';
+
+    const recreatedWebexWindows = matches
+      .filter((item) => item.provider === 'webex'
+        && item.evidence?.some((evidence) => evidence.kind === 'webex_window_recreated'))
+      .map((item) => {
+        const previousWindowId = currentCapture?.provider === 'webex'
+          && Number(currentCapture.processId) === Number(item.pid)
+          ? currentCapture.windowId
+          : item.webexCanonicalWindowId;
+        return `pid=${item.pid}:${previousWindowId || item.webexCanonicalWindowId}->${item.windowId}:${item.identityKey}`;
+      })
+      .sort()
+      .join(' | ');
+    if (recreatedWebexWindows && recreatedWebexWindows !== lastWebexWindowRecreationSnapshot) {
+      lastWebexWindowRecreationSnapshot = recreatedWebexWindows;
+      console.info(`[Webex desktop] top-level window recreated during the same verified call; preserving its Contexa session identity: ${recreatedWebexWindows}`);
+    } else if (!recreatedWebexWindows) {
+      lastWebexWindowRecreationSnapshot = '';
+    }
+
+    // A terminal-to-present transition is a genuine rejoin of the same stable call ID.
+    // It may lift that call's restart block, but ordinary tab returns never do.
+    if (restartBlocks.length) {
+      const rejoined = lifecycle.events.filter((event) =>
+        restartBlocks.some((block) => lifecycleEventMatchesRestartBlock(event, block))
+      );
+      if (rejoined.length) {
+        for (const event of rejoined) {
+          console.info(`[Meeting lifecycle] rejoined ${event.provider}/${event.identityKey} (epoch ${event.epoch}); clearing only that meeting's restart block.`);
+        }
+        restartBlocks = restartBlocks.filter((block) =>
+          !rejoined.some((event) => lifecycleEventMatchesRestartBlock(event, block))
+        );
+      }
+    }
+
+    for (const event of lifecycle.events) {
+      if (['discovered', 'temporarily_missing', 'missing_expired', 'returned'].includes(event.type)) {
+        console.info(`[Meeting lifecycle] ${event.type}: ${event.provider}/${event.identityKey}, state=${event.state}, epoch=${event.epoch}.`);
+      }
+    }
+
     // Log only recognized meeting-window metadata. Ordinary window titles can contain
     // document names or other private content and must not be copied into Contexa logs.
     const windowSnapshot = matches
-      .map((item) => `${item.pid}:${meetingKey(item.processName, item.title)}:${item.foreground ? 'foreground' : 'background'}`)
+      .map((item) => `${item.provider}/${item.source}:${item.identityKey}:${item.state}:${item.confidence}:${item.pid}:${item.windowFocus}:epoch${item.lifecycleEpoch}`)
       .sort()
       .join(' | ');
     if (windowSnapshot !== lastMeetingWindowSnapshot) {
@@ -1077,6 +1259,41 @@ async function monitorMeetingWindows() {
     if (currentCapture) {
       const now = Date.now();
       const transition = classifyWindowTransition(matches, currentCapture);
+
+      if (transition.type === 'meeting-ended') {
+        restartBlocks = addRestartBlock(restartBlocks, {
+          pid: currentCapture.processId,
+          provider: currentCapture.provider,
+          key: currentCapture.sessionKey,
+          windowId: currentCapture.windowId,
+          until: now + IDLE_RESTART_BLOCK_MS,
+        });
+        console.info(`Provider window explicitly reports ${transition.window.state}; finalizing capture for ${currentCapture.meetingId}.`);
+        crossProviderHandoff.reset();
+        await stopCapture(`Provider reported meeting ${transition.window.state}`, { endNow: true });
+        return;
+      }
+
+      const handoffCandidate = crossProviderHandoff.observe(matches, currentCapture, {
+        now,
+        transitionType: transition.type,
+        lastMeetingAudioAt: currentCapture.audioStats?.lastMeetingAudioAt || 0,
+        restartBlocks,
+      });
+      if (handoffCandidate) {
+        const previousCapture = currentCapture;
+        restartBlocks = addRestartBlock(restartBlocks, {
+          pid: previousCapture.processId,
+          provider: previousCapture.provider,
+          key: previousCapture.sessionKey,
+          windowId: previousCapture.windowId,
+          until: now + IDLE_RESTART_BLOCK_MS,
+        });
+        console.info(`[Meeting arbitration] confirmed foreground ${handoffCandidate.provider} meeting (PID ${handoffCandidate.pid}) after ${Math.round(CROSS_PROVIDER_HANDOFF_QUIET_MS / 1000)}s without meeting-side audio from ${previousCapture.provider}; handing off the single capture stream.`);
+        await stopCapture(`A different foreground meeting was detected: ${handoffCandidate.title || handoffCandidate.displayTitle || handoffCandidate.provider}`, { endNow: true });
+        await startCaptureForWindow(handoffCandidate);
+        return;
+      }
 
       if (transition.type === 'same-window') {
         currentCapture.lastMatchedAt = now;
@@ -1120,8 +1337,14 @@ async function monitorMeetingWindows() {
         const differentIdentifiedMeeting = transition.window;
         // A different explicit call ID in the same long-lived browser process is a new meeting,
         // not a title flap. End the old session before starting the new one.
+        restartBlocks = addRestartBlock(restartBlocks, {
+          pid: currentCapture.processId,
+          provider: currentCapture.provider,
+          key: currentCapture.sessionKey,
+          windowId: currentCapture.windowId,
+          until: Date.now() + IDLE_RESTART_BLOCK_MS,
+        });
         await stopCapture(`A different meeting identity was detected (${currentCapture.sessionKey} → ${meetingKey(differentIdentifiedMeeting.processName, differentIdentifiedMeeting.title)})`, { endNow: true });
-        restartBlock = null;
         await startCaptureForWindow(differentIdentifiedMeeting);
         return;
       } else if (transition.type === 'same-meeting-new-process') {
@@ -1137,23 +1360,35 @@ async function monitorMeetingWindows() {
         startedAt: currentCapture.startedAt,
         lastMatchedAt: currentCapture.lastMatchedAt,
         lastAudibleAt: currentCapture.audioStats?.lastAudibleAt || 0,
+        lastMeetingAudioAt: currentCapture.audioStats?.lastMeetingAudioAt || 0,
         policy: CAPTURE_POLICY,
       });
       if (stop?.reason === 'window-missing') {
         await stopCapture(`The meeting window was not present for ${Math.round(stop.missingForMs / 1000)} seconds and no one was audible for ${Math.round(stop.quietForMs / 1000)} seconds`);
       } else if (stop?.reason === 'idle') {
-        // The meeting page can stay open after the call ends. Silence from everyone means it is over.
-        restartBlock = { pid: currentCapture.processId, key: currentCapture.sessionKey, until: now + IDLE_RESTART_BLOCK_MS };
-        await stopCapture(`No one was audible for ${Math.round(stop.quietForMs / 1000)} seconds; treating the meeting as ended`, { endNow: true });
+        // Microphone-only speech must not keep a departed browser call alive indefinitely.
+        // The timeout uses meeting/application audio, while the microphone remains a
+        // separate transcript channel. This is a fallback until provider DOM state is
+        // available; long meetings with no incoming app audio can be ended by this policy.
+        restartBlocks = addRestartBlock(restartBlocks, {
+          pid: currentCapture.processId,
+          provider: currentCapture.provider,
+          key: currentCapture.sessionKey,
+          windowId: currentCapture.windowId,
+          until: now + IDLE_RESTART_BLOCK_MS,
+        });
+        const idleSource = stop.activitySource === 'meeting-audio' ? 'meeting-side audio' : 'meeting-side audio (not observed since capture began)';
+        await stopCapture(`No ${idleSource} for ${Math.round(stop.quietForMs / 1000)} seconds; ending the automatic capture`, { endNow: true });
       }
       return;
     }
 
-    const selection = selectStartCandidate(matches, restartBlock, Date.now(), (windowInfo) => meetingKey(windowInfo.processName, windowInfo.title));
-    restartBlock = selection.block;
+    crossProviderHandoff.reset();
+    const selection = selectStartCandidate(matches, restartBlocks, Date.now(), (windowInfo) => windowInfo.identityKey || meetingKey(windowInfo.processName, windowInfo.title));
+    restartBlocks = selection.blocks || selection.block || [];
     const match = selection.candidate;
     if (match) {
-      const attemptKey = `${match.pid}:${meetingKey(match.processName, match.title)}`;
+      const attemptKey = `${match.pid}:${match.identityKey || meetingKey(match.processName, match.title)}`;
       const elapsedSinceAttempt = Date.now() - lastStartAttemptAt;
       if (attemptKey !== lastStartAttemptKey || elapsedSinceAttempt >= 30000) {
         lastStartAttemptKey = attemptKey;
@@ -1239,7 +1474,7 @@ async function enableAutoCapture() {
 async function pauseAutoCapture() {
   settings.autoCaptureEnabled = false;
   settings.autoCapturePausedByUser = true; // stays paused across restarts until the user turns it back on
-  restartBlock = null;
+  restartBlocks = [];
   settings.firstRunPromptSeen = true;
   setStartupEnabled(false);
   stopMonitoring();
@@ -1250,9 +1485,35 @@ async function pauseAutoCapture() {
   return { ok: true, message: 'Auto Capture is paused. No new meeting audio will be captured.', status: getDesktopStatus() };
 }
 
+async function endAutoCapturedMeeting(meetingId) {
+  const plan = planAutoCaptureEnd(meetingId, currentCapture, Date.now(), IDLE_RESTART_BLOCK_MS);
+  if (!plan.ok) {
+    return {
+      ok: false,
+      message: 'A valid meeting session is required.',
+      status: getDesktopStatus(),
+    };
+  }
+
+  if (plan.shouldStop) {
+    // Block only the just-ended meeting identity. Other providers (for example Zoom)
+    // remain eligible on the next detector poll.
+    restartBlocks = addRestartBlock(restartBlocks, plan.restartBlock);
+    await stopCapture('Meeting ended from the Contexa workspace', { persistSession: false });
+  }
+
+  return {
+    ok: true,
+    stopped: plan.shouldStop,
+    message: plan.shouldStop ? 'Desktop audio capture has stopped.' : 'No desktop audio stream was attached to this session.',
+    status: getDesktopStatus(),
+  };
+}
+
 ipcMain.handle('contexa:get-status', () => getDesktopStatus());
 ipcMain.handle('contexa:enable-auto-capture', () => enableAutoCapture());
 ipcMain.handle('contexa:pause-auto-capture', () => pauseAutoCapture());
+ipcMain.handle('contexa:end-auto-captured-meeting', (_event, meetingId) => endAutoCapturedMeeting(meetingId));
 
 function updateTrayMenu() {
   if (!tray) return;

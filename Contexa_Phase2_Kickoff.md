@@ -104,4 +104,29 @@ Implemented in this working snapshot:
 - Added provider-aware detection logs without logging ordinary non-meeting window titles.
 - Added fixture tests for Google Meet, Zoom, Teams, Webex, browser/native sources, title states, confidence, stable IDs and HWND propagation.
 
-The next increment is Phase 2.2: split the current title/process heuristics into provider-specific, fixture-driven adapters and expand native Zoom/Teams/Webex detection without broadening false-positive matching.
+Phase 2.1 is integrated into the live Electron monitoring path. The new observations now supply the detector loop, while compatibility aliases preserve the tested Phase 1 identity/capture behavior.
+
+### Phase 2.2 initial provider-adapter baseline
+
+Implemented in this working snapshot:
+
+- Added provider-specific adapters for Google Meet, Zoom, Microsoft Teams, and Webex under `desktop/providers/`.
+- Routed both `capture-policy.mjs` and `meeting-observation.mjs` through the same adapter registry, removing duplicate provider-recognition rules.
+- Added positive and negative fixtures for browser and native windows, plus rejection cases for home, settings, chat, activity, calendar, and unrelated windows.
+- Distinguished explicit `left` title evidence from explicit `ended` title evidence. `active` means Contexa has an existing capture associated with the currently observed identity; it is not provider-authoritative call state.
+- At the initial provider-adapter baseline, desktop validation had 103 passing tests; the later refinement now raises the suite to 133.
+
+The next refinement is to collect fixture titles from actual installed Zoom, Teams, and Webex clients on Windows, improve provider-specific leave/end evidence, and then move to the independent lifecycle registry. Do not interpret the current title rules as authoritative provider call-state detection.
+
+## Phase 2.2 refinement status — fixture-complete, live validation pending
+
+The provider adapters have been tightened beyond the initial baseline:
+
+- Provider matches now emit confidence and evidence, and the shared observation contract preserves those fields.
+- Google Meet permission prompts are excluded without suppressing waiting-room or call-code titles.
+- Zoom recognizes native/browser meeting, call, and webinar surfaces while rejecting ordinary app areas.
+- Microsoft Teams recognizes the current `ms-teams.exe` family, classic Teams, browser meetings, and explicit call-state titles. Generic calendar/chat/schedule text no longer qualifies.
+- Webex recognizes the documented Windows host and join-helper executable families, but the process name alone never starts capture.
+- Joining, left, and ended title patterns are preserved as explicit lifecycle evidence.
+
+Validation in the reconstructed working tree: desktop syntax checks pass; 133 desktop tests pass. Google Meet and Zoom have passed live Windows tests. Teams and Webex remain unverified on the user's installed clients; Phase 2.2 stays open until those live tests pass.
