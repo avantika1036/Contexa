@@ -53,6 +53,105 @@ function chooseRepresentative(observations) {
   )[0];
 }
 
+/**
+ * Identify one observed provider window without conflating it with the meeting it
+ * represents. Durable meeting IDs intentionally do not participate in this key: one
+ * meeting may be visible through several windows or even several processes.
+ */
+export function meetingWindowKey(observation) {
+  if (!observation || typeof observation !== 'object') return null;
+  const source = cleanText(observation.source).toLowerCase() || 'unknown';
+  const pid = Number(observation.processId ?? observation.pid);
+  const windowId = cleanText(observation.windowId);
+  if ((!Number.isInteger(pid) || pid <= 0) && !windowId) return null;
+  return `${source}|pid:${Number.isInteger(pid) && pid > 0 ? pid : 'unknown'}|hwnd:${windowId || 'unknown'}`;
+}
+
+function normalizedWindowState(value) {
+  const state = String(value || 'unknown');
+  return PRESENT_STATES.has(state) || TERMINAL_STATES.has(state) ? state : 'unknown';
+}
+
+function makeWindowRecord(observation, previous, now) {
+  const state = normalizedWindowState(observation.state);
+  const previousState = previous?.state;
+  // A stale background surface must not undo a confirmed leave/end for this exact
+  // window. A foreground/call-specific observation can still establish a rejoin.
+  const retainTerminal = TERMINAL_STATES.has(String(previousState || ''))
+    && !TERMINAL_STATES.has(state)
+    && !REJOIN_STATES.has(state);
+  const nextState = retainTerminal ? previousState : state;
+  return {
+    windowKey: meetingWindowKey(observation),
+    source: cleanText(observation.source).toLowerCase() || 'unknown',
+    pid: Number(observation.processId ?? observation.pid) || null,
+    processName: cleanText(observation.processName) || null,
+    windowId: cleanText(observation.windowId) || null,
+    displayTitle: cleanText(observation.displayTitle) || null,
+    state: nextState,
+    confidence: cleanText(observation.confidence).toLowerCase() || 'unknown',
+    foreground: observation.foreground === true || observation.windowFocus === 'foreground',
+    windowFocus: observation.windowFocus === 'foreground' || observation.foreground === true
+      ? 'foreground'
+      : 'background',
+    firstSeenAt: previous?.firstSeenAt ?? now,
+    lastSeenAt: now,
+    missingSince: null,
+    terminalAt: TERMINAL_STATES.has(nextState)
+      ? (previous?.terminalAt || now)
+      : null,
+  };
+}
+
+function updateWindowInventory(entry, observations, now, missingGraceMs, retentionMs) {
+  if (!(entry.windows instanceof Map)) entry.windows = new Map();
+  const observedKeys = new Set();
+
+  for (const observation of observations) {
+    const windowKey = meetingWindowKey(observation);
+    if (!windowKey) continue;
+    observedKeys.add(windowKey);
+    const previous = entry.windows.get(windowKey) || null;
+    entry.windows.set(windowKey, makeWindowRecord(observation, previous, now));
+  }
+
+  for (const [windowKey, window] of entry.windows) {
+    if (observedKeys.has(windowKey) || TERMINAL_STATES.has(window.state)) continue;
+    if (window.state !== 'temporarily_missing' && window.state !== 'unknown') {
+      entry.windows.set(windowKey, {
+        ...window,
+        state: 'temporarily_missing',
+        missingSince: now,
+      });
+    } else if (window.state === 'temporarily_missing'
+      && now - Number(window.missingSince || now) >= missingGraceMs) {
+      entry.windows.set(windowKey, { ...window, state: 'unknown' });
+    }
+  }
+
+  for (const [windowKey, window] of entry.windows) {
+    const age = now - window.lastSeenAt;
+    const retainedTerminal = TERMINAL_STATES.has(window.state)
+      && now - Number(window.terminalAt || window.lastSeenAt) <= retentionMs;
+    const retainedMissing = ['temporarily_missing', 'unknown'].includes(window.state)
+      && age <= retentionMs;
+    if (!observedKeys.has(windowKey) && !retainedTerminal && !retainedMissing) {
+      entry.windows.delete(windowKey);
+    }
+  }
+
+  entry.windowCount = observedKeys.size;
+}
+
+function cloneEntry(entry) {
+  return {
+    ...entry,
+    windows: [...(entry.windows?.values?.() || [])]
+      .map((window) => ({ ...window }))
+      .sort((left, right) => left.windowKey.localeCompare(right.windowKey)),
+  };
+}
+
 function makeEvent(type, entry, fromState = null) {
   return {
     type,
@@ -120,7 +219,8 @@ export class MeetingLifecycleRegistry {
           lastSeenAt: now,
           missingSince: null,
           terminalAt: TERMINAL_STATES.has(incomingState) ? now : null,
-          windowCount: group.length,
+          windowCount: 0,
+          windows: new Map(),
         };
         eventType = 'discovered';
       } else {
@@ -169,6 +269,7 @@ export class MeetingLifecycleRegistry {
         }
       }
 
+      updateWindowInventory(entry, group, now, this.missingGraceMs, this.retentionMs);
       this.entries.set(lifecycleKey, entry);
       seen.add(lifecycleKey);
       metadataByKey.set(lifecycleKey, {
@@ -180,7 +281,9 @@ export class MeetingLifecycleRegistry {
     }
 
     for (const [lifecycleKey, entry] of this.entries) {
-      if (seen.has(lifecycleKey) || TERMINAL_STATES.has(entry.state)) continue;
+      if (seen.has(lifecycleKey)) continue;
+      updateWindowInventory(entry, [], now, this.missingGraceMs, this.retentionMs);
+      if (TERMINAL_STATES.has(entry.state)) continue;
 
       if (entry.state !== 'temporarily_missing' && entry.state !== 'unknown') {
         const previousState = entry.state;
@@ -217,7 +320,7 @@ export class MeetingLifecycleRegistry {
   }
 
   getSnapshot() {
-    return [...this.entries.values()].map((entry) => ({ ...entry }));
+    return [...this.entries.values()].map(cloneEntry);
   }
 
   clear() {
