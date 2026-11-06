@@ -341,6 +341,22 @@ test('a missing window is tracked independently while another representation rem
   assert.equal(expiredWindow.windowCount, 1);
 });
 
+test('a missing window clears stale foreground state while retaining its missing grace', () => {
+  const registry = new MeetingLifecycleRegistry({ missingGraceMs: 5_000, retentionMs: 20_000 });
+  registry.update([observation({ state: 'candidate', foreground: true, windowFocus: 'foreground' })], { now: 1_000 });
+
+  const missing = registry.update([], { now: 2_000 }).snapshot[0].windows[0];
+  assert.equal(missing.state, 'temporarily_missing');
+  assert.equal(missing.foreground, false);
+  assert.equal(missing.windowFocus, 'unknown');
+  assert.equal(missing.missingSince, 2_000);
+
+  const expired = registry.update([], { now: 7_001 }).snapshot[0].windows[0];
+  assert.equal(expired.state, 'unknown');
+  assert.equal(expired.foreground, false);
+  assert.equal(expired.windowFocus, 'unknown');
+});
+
 test('a returning window keeps the meeting epoch and clears its missing state', () => {
   const registry = new MeetingLifecycleRegistry({ missingGraceMs: 5_000, retentionMs: 20_000 });
   const first = observation({ windowId: '5001', state: 'active' });

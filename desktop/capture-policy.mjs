@@ -4,6 +4,7 @@
 // Capture lifecycle decisions combine these observations with continuity and audio evidence.
 
 import { detectProviderWindow } from './providers/index.mjs';
+import { isDurableMeetingKey } from './meeting-session.mjs';
 
 export const DEFAULT_POLICY = Object.freeze({
   stopAfterMissingMs: 15_000,        // meeting window not seen for this long...
@@ -61,6 +62,134 @@ function isDurableKey(value) {
   return /^(?:meet:[a-z]{3}-[a-z]{4}-[a-z]{3}|(?:zoom|teams|webex):id:\d{8,13}|webex:launch:[a-f0-9]{24}|webex:window:\d+:[A-Za-z0-9_-]{1,80}(?:-call\d+)?)$/i.test(String(value || ''));
 }
 
+function lifecycleIdentityForObservation(row) {
+  const provider = String(row?.provider || '').toLowerCase();
+  const identityKey = String(row?.identityKey || '').trim();
+  if (!provider || !identityKey) return '';
+  if (row?.lifecycleKey) return String(row.lifecycleKey);
+  if (row?.durableIdentity === true || isDurableMeetingKey(identityKey)) {
+    return `${provider}|${identityKey}`;
+  }
+  const pid = Number(row?.pid ?? row?.processId);
+  const windowId = String(row?.windowId || '');
+  return `${provider}|${identityKey}|pid:${Number.isInteger(pid) ? pid : 0}|hwnd:${windowId || 'unknown'}`;
+}
+
+/**
+ * Return process IDs that currently represent more than one independent meeting.
+ * Process-loopback audio cannot separate those meetings, so auto capture must not
+ * start or remain attached to either one until a meeting-tab/native isolated source
+ * is available. Duplicate windows for one durable meeting remain a single identity.
+ */
+function flattenMeetingObservationRows(observations) {
+  const rows = [];
+  for (const item of Array.isArray(observations) ? observations : []) {
+    if (Array.isArray(item?.windows)) {
+      for (const window of item.windows) {
+        rows.push({
+          ...window,
+          provider: item.provider,
+          identityKey: item.identityKey,
+          durableIdentity: item.durableIdentity === true,
+          lifecycleKey: item.lifecycleKey,
+        });
+      }
+    } else if (item && typeof item === 'object') {
+      rows.push(item);
+    }
+  }
+  return rows;
+}
+
+export function findAmbiguousMeetingProcessIds(observations) {
+  // Retained lifecycle snapshots contain window records that may have disappeared
+  // from the latest EnumWindows scan. Treat temporarily-missing records as potentially
+  // active during the configured missing grace period. `unknown` is the post-grace
+  // state: retain it for recovery/history, but no longer treat it as current.
+  const states = new Set(['candidate', 'joining', 'active', 'background', 'temporarily_missing']);
+  const rows = flattenMeetingObservationRows(observations);
+
+  // Google Meet may briefly expose a generic `browser:*` surface while the same
+  // browser process also has a call-specific `meet:<code>` observation. A generic
+  // background surface is not proof of a second live call. Do not let it veto a
+  // known call merely because the browser title changed or another ordinary Meet
+  // page is open. A foreground generic Meet surface alongside a different call is
+  // still treated as ambiguous, because it may be a second pre-join/live meeting.
+  const concreteGoogleMeetPids = new Set(rows
+    .filter((row) => String(row?.provider || '').toLowerCase() === 'google_meet'
+      && /^meet:[a-z]{3}-[a-z]{4}-[a-z]{3}$/i.test(String(row?.identityKey || '')))
+    .map((row) => Number(row?.pid ?? row?.processId))
+    .filter((pid) => Number.isInteger(pid) && pid > 0));
+
+  // A single Google Meet HWND can change from a page-title fallback such as
+  // `browser:google meet: online...` to its durable `meet:<code>` identity after
+  // the call loads. The lifecycle registry intentionally keeps both identity
+  // histories for recovery, but they are NOT two independent meetings when they
+  // refer to the exact same PID + HWND. A different HWND remains independent.
+  const concreteGoogleMeetWindows = new Set(rows
+    .filter((row) => String(row?.provider || '').toLowerCase() === 'google_meet'
+      && /^meet:[a-z]{3}-[a-z]{4}-[a-z]{3}$/i.test(String(row?.identityKey || ''))
+      && String(row?.windowId || '').trim())
+    .map((row) => `${Number(row?.pid ?? row?.processId)}|${String(row.windowId)}`));
+
+  const identitiesByPid = new Map();
+  for (const row of rows) {
+    const pid = Number(row?.pid ?? row?.processId);
+    const state = String(row?.state || '').toLowerCase();
+    const identity = lifecycleIdentityForObservation(row);
+    if (!Number.isInteger(pid) || pid <= 0 || !states.has(state) || !identity) continue;
+
+    const provider = String(row?.provider || '').toLowerCase();
+    const identityKey = String(row?.identityKey || '').trim().toLowerCase();
+    const isGenericGoogleMeet = provider === 'google_meet' && identityKey === 'browser:*';
+    const isForeground = row?.foreground === true || row?.windowFocus === 'foreground';
+    if (isGenericGoogleMeet && concreteGoogleMeetPids.has(pid) && !isForeground) continue;
+
+    const isProvisionalGoogleMeet = provider === 'google_meet'
+      && identityKey.startsWith('browser:')
+      && !/^meet:[a-z]{3}-[a-z]{4}-[a-z]{3}$/i.test(identityKey);
+    const windowId = String(row?.windowId || '').trim();
+    if (isProvisionalGoogleMeet && windowId
+      && concreteGoogleMeetWindows.has(`${pid}|${windowId}`)) continue;
+
+    const identities = identitiesByPid.get(pid) || new Set();
+    identities.add(identity);
+    identitiesByPid.set(pid, identities);
+  }
+  return [...identitiesByPid.entries()]
+    .filter(([, identities]) => identities.size > 1)
+    .map(([pid]) => pid)
+    .sort((left, right) => left - right);
+}
+
+/** Return privacy-minimized identity/state diagnostics for one ambiguous process. */
+export function describeMeetingProcessIdentities(observations, processId) {
+  const wantedPid = Number(processId);
+  if (!Number.isInteger(wantedPid) || wantedPid <= 0) return [];
+  const summaries = new Map();
+  const rows = flattenMeetingObservationRows(observations);
+  const concreteGoogleMeetWindows = new Set(rows
+    .filter((row) => String(row?.provider || '').toLowerCase() === 'google_meet'
+      && /^meet:[a-z]{3}-[a-z]{4}-[a-z]{3}$/i.test(String(row?.identityKey || ''))
+      && String(row?.windowId || '').trim())
+    .map((row) => `${Number(row?.pid ?? row?.processId)}|${String(row.windowId)}`));
+
+  for (const row of rows) {
+    const pid = Number(row?.pid ?? row?.processId);
+    if (pid !== wantedPid) continue;
+    const provider = String(row?.provider || 'unknown').toLowerCase();
+    const identityKey = String(row?.identityKey || 'unknown');
+    const windowId = String(row?.windowId || '').trim();
+    if (provider === 'google_meet' && identityKey.toLowerCase().startsWith('browser:')
+      && windowId && concreteGoogleMeetWindows.has(`${pid}|${windowId}`)) continue;
+    const state = String(row?.state || 'unknown').toLowerCase();
+    const focus = row?.foreground === true || row?.windowFocus === 'foreground' ? 'foreground' : 'background';
+    const key = `${provider}|${identityKey}|${state}|${focus}|${windowId}`;
+    summaries.set(key, `${provider}/${identityKey}:${state}:${focus}${windowId ? `:hwnd=${windowId}` : ''}`);
+  }
+  return [...summaries.values()].sort((a, b) => a.localeCompare(b, 'en'));
+}
+
 function isRestartBlocked(row, blocks, now, keyOf) {
   const pid = Number(row?.pid ?? row?.processId);
   const provider = String(row?.provider || '').toLowerCase();
@@ -89,7 +218,7 @@ function isRestartBlocked(row, blocks, now, keyOf) {
   });
 }
 
-function hasVerifiedActiveWebexDesktopEvidence(row) {
+export function hasVerifiedActiveWebexDesktopEvidence(row) {
   if (String(row?.provider || '').toLowerCase() !== 'webex') return false;
   if (String(row?.source || '').toLowerCase() !== 'native_window') return false;
   if (String(row?.state || '').toLowerCase() !== 'active' || row?.confidence !== 'high') return false;
@@ -99,10 +228,14 @@ function hasVerifiedActiveWebexDesktopEvidence(row) {
   );
 }
 
-export function selectStartCandidate(matches, blocks, now, keyOf) {
+export function selectStartCandidate(matches, blocks, now, keyOf, registrySnapshot = null) {
   const rows = Array.isArray(matches) ? matches : [];
+  const ambiguitySource = registrySnapshot ? [...rows, ...registrySnapshot] : rows;
+  const ambiguousProcessIds = new Set(findAmbiguousMeetingProcessIds(ambiguitySource));
   const activeBlocks = normalizeRestartBlocks(blocks).filter((block) => now < Number(block.until || 0));
   const eligible = rows.filter((row) => {
+    const pid = Number(row?.pid ?? row?.processId);
+    if (ambiguousProcessIds.has(pid)) return false;
     const state = String(row?.state || '').toLowerCase();
     if (['left', 'ended', 'temporarily_missing', 'unknown'].includes(state)) return false;
     // Normal background windows must never steal the capture slot. Webex Desktop is
@@ -116,7 +249,23 @@ export function selectStartCandidate(matches, blocks, now, keyOf) {
   });
   const candidate = eligible.sort((a, b) => {
     const confidenceRank = (value) => value === 'high' ? 2 : value === 'medium' ? 1 : 0;
-    return confidenceRank(b.confidence) - confidenceRank(a.confidence);
+    const stateRank = (value) => ({ active: 4, joining: 3, candidate: 2, background: 1 })[String(value || '').toLowerCase()] || 0;
+    const foregroundRank = (row) => row?.foreground === true || row?.windowFocus === 'foreground' ? 1 : 0;
+    const foregroundDifference = foregroundRank(b) - foregroundRank(a);
+    if (foregroundDifference) return foregroundDifference;
+    const confidenceDifference = confidenceRank(b.confidence) - confidenceRank(a.confidence);
+    if (confidenceDifference) return confidenceDifference;
+    const stateDifference = stateRank(b.state) - stateRank(a.state);
+    if (stateDifference) return stateDifference;
+    const observedDifference = (Number(b.observedAt) || 0) - (Number(a.observedAt) || 0);
+    if (observedDifference) return observedDifference;
+    const keyOf = (row) => [
+      String(row?.provider || '').toLowerCase(),
+      String(row?.identityKey || ''),
+      Number(row?.pid ?? row?.processId) || 0,
+      String(row?.windowId || ''),
+    ].join('|');
+    return keyOf(a).localeCompare(keyOf(b), 'en');
   })[0] || null;
   return { candidate, block: activeBlocks, blocks: activeBlocks };
 }

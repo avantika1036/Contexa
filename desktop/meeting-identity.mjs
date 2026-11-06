@@ -21,7 +21,11 @@ export async function resolveStableMeetingWindow({
 }) {
   if (!initialWindow || typeof getWindows !== 'function' || typeof keyOf !== 'function') return initialWindow;
   const initialKey = keyOf(initialWindow);
-  if (initialKey !== 'browser:*' || !browserFamily(initialWindow.processName)) return initialWindow;
+  const provisionalGoogleMeet = initialKey === 'browser:*'
+    || (String(initialWindow.provider || '').toLowerCase() === 'google_meet'
+      && String(initialKey || '').startsWith('browser:')
+      && !isDurableMeetingKey(initialKey));
+  if (!provisionalGoogleMeet || !browserFamily(initialWindow.processName)) return initialWindow;
 
   const deadline = Date.now() + Math.max(0, timeoutMs);
   while (Date.now() < deadline) {
@@ -29,7 +33,10 @@ export async function resolveStableMeetingWindow({
     let windows = [];
     try { windows = await getWindows(); } catch { windows = []; }
     const sameProcess = (windows || []).filter((item) => item.pid === initialWindow.pid
-      && String(item.processName || '').toLowerCase() === String(initialWindow.processName || '').toLowerCase());
+      && String(item.processName || '').toLowerCase() === String(initialWindow.processName || '').toLowerCase()
+      // If EnumWindows gave us a concrete HWND, only promote from that exact window.
+      // Another Meet call in the same browser process must never supply this window's ID.
+      && (!initialWindow.windowId || String(item.windowId || '') === String(initialWindow.windowId)));
     const identified = sameProcess.filter((item) => isDurableMeetingKey(keyOf(item)));
     if (identified.length === 1) return identified[0];
     if (identified.length > 1) {

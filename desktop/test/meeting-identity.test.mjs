@@ -51,3 +51,53 @@ test('uses the only foreground explicit Meet call when multiple calls share a br
   });
   assert.equal(resolved.title, identified.title);
 });
+
+test('waits for a durable call ID when the initial Google Meet key is a descriptive page-title fallback', async () => {
+  const initial = {
+    ...generic,
+    provider: 'google_meet',
+    windowId: 'edge-meet-hwnd',
+    title: 'Google Meet: Online web and video conferencing calls | Google Workspace',
+    identityKey: 'browser:google meet: online web and video conferencing calls',
+  };
+  const identifiedSameWindow = {
+    ...identified,
+    windowId: 'edge-meet-hwnd',
+  };
+
+  const resolved = await resolveStableMeetingWindow({
+    initialWindow: initial,
+    keyOf: (item) => item.identityKey || keyOf(item),
+    timeoutMs: 20,
+    pollMs: 1,
+    sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    getWindows: async () => [identifiedSameWindow],
+  });
+
+  assert.equal(resolved, identifiedSameWindow);
+});
+
+test('a descriptive Google Meet fallback never adopts a call ID from another HWND in the same process', async () => {
+  const initial = {
+    ...generic,
+    provider: 'google_meet',
+    windowId: 'edge-page-hwnd',
+    title: 'Google Meet: Online web and video conferencing calls | Google Workspace',
+    identityKey: 'browser:google meet: online web and video conferencing calls',
+  };
+  const identifiedOtherWindow = {
+    ...identified,
+    windowId: 'edge-call-hwnd',
+  };
+
+  const resolved = await resolveStableMeetingWindow({
+    initialWindow: initial,
+    keyOf: (item) => item.identityKey || keyOf(item),
+    timeoutMs: 8,
+    pollMs: 1,
+    sleepImpl: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    getWindows: async () => [identifiedOtherWindow],
+  });
+
+  assert.equal(resolved, initial);
+});

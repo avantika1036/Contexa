@@ -176,6 +176,24 @@ test('promotes a Google Meet call code as active when the capture started before
   assert.equal(marked[0].state, 'active');
 });
 
+test('promotes a later Google Meet call code for the same HWND when capture began from a page-title fallback', () => {
+  const observations = normalizeMeetingObservations([
+    { pid: 35724, processName: 'msedge', title: 'Meet - fai-wivv-szk', foreground: true, windowId: 'edge-meet-hwnd' },
+    { pid: 35724, processName: 'msedge', title: 'Meet - emh-saes-zmn', foreground: false, windowId: 'edge-other-hwnd' },
+  ]);
+  const marked = markActiveMeetingObservations(observations, {
+    processId: 35724,
+    processName: 'msedge',
+    provider: 'google_meet',
+    windowId: 'edge-meet-hwnd',
+    sessionKey: 'browser:google meet: online web and video conferencing calls',
+  });
+
+  const states = Object.fromEntries(marked.map((item) => [item.identityKey, item.state]));
+  assert.equal(states['meet:fai-wivv-szk'], 'active');
+  assert.equal(states['meet:emh-saes-zmn'], 'background');
+});
+
 
 test('Webex canonical HWND and call epoch survive the second normalization pass', () => {
   const tracker = new WebexMeetingControlTracker();

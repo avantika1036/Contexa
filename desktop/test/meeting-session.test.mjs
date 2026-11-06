@@ -185,6 +185,49 @@ test('uses the sole foreground Google Meet call when multiple calls share one br
   assert.equal(result.sessionKey, 'meet:emh-saes-zmn');
 });
 
+test('a descriptive Google Meet page-title fallback upgrades from the same HWND only', () => {
+  const current = {
+    processId: 35724,
+    processName: 'msedge',
+    provider: 'google_meet',
+    windowId: 'edge-meet-hwnd',
+    sessionKey: 'browser:google meet: online web and video conferencing calls',
+  };
+  const sameWindow = {
+    pid: 35724,
+    processName: 'msedge',
+    provider: 'google_meet',
+    windowId: 'edge-meet-hwnd',
+    title: 'Meet - fai-wivv-szk - Microsoft Edge',
+    foreground: true,
+  };
+
+  const result = classifyWindowTransition([sameWindow], current);
+  assert.equal(result.type, 'same-meeting-identity-upgrade');
+  assert.equal(result.sessionKey, 'meet:fai-wivv-szk');
+  assert.equal(result.window, sameWindow);
+});
+
+test('a descriptive Google Meet fallback never borrows a call ID from another HWND', () => {
+  const current = {
+    processId: 35724,
+    processName: 'msedge',
+    provider: 'google_meet',
+    windowId: 'edge-page-hwnd',
+    sessionKey: 'browser:google meet: online web and video conferencing calls',
+  };
+  const anotherWindow = {
+    pid: 35724,
+    processName: 'msedge',
+    provider: 'google_meet',
+    windowId: 'edge-call-hwnd',
+    title: 'Meet - fai-wivv-szk - Microsoft Edge',
+    foreground: true,
+  };
+
+  assert.equal(classifyWindowTransition([anotherWindow], current).type, 'missing');
+});
+
 
 test('same Chrome process remains a continuity signal when the selected tab title changes', () => {
   const current = { processId: 36380, processName: 'chrome', sessionKey: 'meet:fai-wivv-szk' };

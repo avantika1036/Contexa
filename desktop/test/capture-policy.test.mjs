@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { captureStopReason, selectStartCandidate, isSupportedMeetingWindow, normalizeDesktopWindows, normalizeMeetingWindows } from '../capture-policy.mjs';
+import { captureStopReason, selectStartCandidate, isSupportedMeetingWindow, normalizeDesktopWindows, normalizeMeetingWindows, findAmbiguousMeetingProcessIds } from '../capture-policy.mjs';
 import { hasSameBrowserProcessWindow } from '../meeting-session.mjs';
+import { MeetingLifecycleRegistry } from '../meeting-lifecycle.mjs';
 
 const base = { startedAt: 0, lastMatchedAt: 0, lastAudibleAt: 0 };
 
@@ -445,4 +446,264 @@ test('a new Webex call epoch is not blocked by the previous epoch End Meeting su
     evidence: [{ kind: 'webex_accessibility', value: 'end-meeting-control-present' }],
   };
   assert.equal(selectStartCandidate([nextCall], blocks, 3_000, (row) => row.identityKey).candidate, nextCall);
+});
+
+test('start-candidate selection is deterministic when foreground meetings have equal priority', () => {
+  const first = { pid: 20, provider: 'google_meet', identityKey: 'meet:abc-defg-hij', windowId: 'hwnd-a', foreground: true, state: 'candidate', confidence: 'high' };
+  const second = { pid: 10, provider: 'google_meet', identityKey: 'meet:klm-nopq-rst', windowId: 'hwnd-b', foreground: true, state: 'candidate', confidence: 'high' };
+  const select = (rows) => selectStartCandidate(rows, null, 500, (row) => row.identityKey).candidate;
+
+  assert.equal(select([second, first]), first);
+  assert.equal(select([first, second]), first);
+});
+
+test('active foreground state outranks a newer candidate observation at equal confidence', () => {
+  const candidate = { pid: 10, provider: 'zoom', identityKey: 'zoom:id:123456789', foreground: true, state: 'candidate', confidence: 'high', observedAt: 900 };
+  const active = { pid: 20, provider: 'teams', identityKey: 'teams:id:123456789', foreground: true, state: 'active', confidence: 'high', observedAt: 800 };
+  assert.equal(selectStartCandidate([candidate, active], null, 1000, (row) => row.identityKey).candidate, active);
+});
+
+
+test('auto capture refuses a process that contains multiple independent live meetings', async () => {
+  const { findAmbiguousMeetingProcessIds } = await import('../capture-policy.mjs');
+  const meetings = [
+    { pid: 36380, provider: 'google_meet', identityKey: 'meet:abc-defg-hij', windowId: 'hwnd-a', foreground: true, state: 'candidate', confidence: 'high' },
+    { pid: 36380, provider: 'google_meet', identityKey: 'meet:klm-nopq-rst', windowId: 'hwnd-b', foreground: false, state: 'background', confidence: 'high' },
+  ];
+  assert.deepEqual(findAmbiguousMeetingProcessIds(meetings), [36380]);
+  assert.equal(selectStartCandidate(meetings, null, 500, (row) => row.identityKey).candidate, null);
+});
+
+
+test('a same-process meeting becomes selectable after the competing missing window expires', () => {
+  const registry = new MeetingLifecycleRegistry({ missingGraceMs: 30_000, retentionMs: 15 * 60_000 });
+  const meetingA = {
+    pid: 36380, processId: 36380, provider: 'google_meet', source: 'browser_window',
+    identityKey: 'meet:abc-defg-hij', durableIdentity: true, windowId: 'hwnd-a',
+    state: 'candidate', confidence: 'high', foreground: true, windowFocus: 'foreground',
+  };
+  const meetingB = {
+    pid: 36380, processId: 36380, provider: 'google_meet', source: 'browser_window',
+    identityKey: 'meet:klm-nopq-rst', durableIdentity: true, windowId: 'hwnd-b',
+    state: 'background', confidence: 'high', foreground: false, windowFocus: 'background',
+  };
+
+  registry.update([meetingA, meetingB], { now: 1_000 });
+  const duringGrace = registry.update([meetingA], { now: 2_000 }).snapshot;
+  assert.deepEqual(findAmbiguousMeetingProcessIds([meetingA, ...duringGrace]), [36380]);
+  assert.equal(
+    selectStartCandidate([meetingA], null, 2_000, (row) => row.identityKey, duringGrace).candidate,
+    null,
+  );
+
+  const afterGrace = registry.update([meetingA], { now: 32_001 }).snapshot;
+  assert.deepEqual(findAmbiguousMeetingProcessIds([meetingA, ...afterGrace]), []);
+  assert.equal(
+    selectStartCandidate([meetingA], null, 32_001, (row) => row.identityKey, afterGrace).candidate,
+    meetingA,
+  );
+});
+
+test('a generic background Google Meet surface does not make a known call process ambiguous', async () => {
+  const { findAmbiguousMeetingProcessIds } = await import('../capture-policy.mjs');
+  const knownCall = {
+    pid: 36380, provider: 'google_meet', identityKey: 'meet:abc-defg-hij',
+    windowId: 'hwnd-call', foreground: true, state: 'active', confidence: 'high',
+  };
+  const genericBackground = {
+    pid: 36380, provider: 'google_meet', identityKey: 'browser:*',
+    windowId: 'hwnd-generic', foreground: false, windowFocus: 'background',
+    state: 'background', confidence: 'medium',
+  };
+  assert.deepEqual(findAmbiguousMeetingProcessIds([knownCall, genericBackground]), []);
+  assert.equal(
+    selectStartCandidate([knownCall, genericBackground], null, 500, (row) => row.identityKey).candidate,
+    knownCall,
+  );
+});
+
+test('a temporarily missing generic Meet surface does not retain stale foreground ambiguity', async () => {
+  const { findAmbiguousMeetingProcessIds } = await import('../capture-policy.mjs');
+  const knownCall = {
+    pid: 36380, provider: 'google_meet', identityKey: 'meet:abc-defg-hij',
+    windowId: 'hwnd-call', foreground: true, state: 'active', confidence: 'high',
+  };
+  const missingGenericSurface = {
+    lifecycleKey: 'google_meet|browser:*',
+    provider: 'google_meet',
+    identityKey: 'browser:*',
+    windows: [{
+      pid: 36380,
+      windowId: 'hwnd-generic',
+      state: 'temporarily_missing',
+      foreground: false,
+      windowFocus: 'unknown',
+    }],
+  };
+  assert.deepEqual(findAmbiguousMeetingProcessIds([knownCall, missingGenericSurface]), []);
+});
+
+test('a foreground generic Google Meet surface alongside another call remains ambiguous', async () => {
+  const { findAmbiguousMeetingProcessIds } = await import('../capture-policy.mjs');
+  const knownBackgroundCall = {
+    pid: 36380, provider: 'google_meet', identityKey: 'meet:abc-defg-hij',
+    windowId: 'hwnd-call', foreground: false, state: 'background', confidence: 'high',
+  };
+  const genericForeground = {
+    pid: 36380, provider: 'google_meet', identityKey: 'browser:*',
+    windowId: 'hwnd-generic', foreground: true, windowFocus: 'foreground',
+    state: 'candidate', confidence: 'medium',
+  };
+  assert.deepEqual(findAmbiguousMeetingProcessIds([knownBackgroundCall, genericForeground]), [36380]);
+});
+
+test('a Google Meet page-title identity is superseded by a call ID on the same PID and HWND', async () => {
+  const { findAmbiguousMeetingProcessIds, describeMeetingProcessIdentities } = await import('../capture-policy.mjs');
+  const pageTitleFallback = {
+    pid: 35724,
+    provider: 'google_meet',
+    identityKey: 'browser:google meet: online web and video conferencing calls',
+    windowId: 'edge-meet-hwnd',
+    state: 'temporarily_missing',
+    foreground: false,
+    windowFocus: 'unknown',
+  };
+  const identifiedCall = {
+    pid: 35724,
+    provider: 'google_meet',
+    identityKey: 'meet:fai-wivv-szk',
+    windowId: 'edge-meet-hwnd',
+    state: 'active',
+    foreground: true,
+    windowFocus: 'foreground',
+  };
+
+  assert.deepEqual(findAmbiguousMeetingProcessIds([pageTitleFallback, identifiedCall]), []);
+  assert.deepEqual(describeMeetingProcessIdentities([pageTitleFallback, identifiedCall], 35724), [
+    'google_meet/meet:fai-wivv-szk:active:foreground:hwnd=edge-meet-hwnd',
+  ]);
+});
+
+test('a page-title fallback on a different HWND remains ambiguous beside a concrete Google Meet call', async () => {
+  const { findAmbiguousMeetingProcessIds } = await import('../capture-policy.mjs');
+  const pageTitleFallback = {
+    pid: 35724,
+    provider: 'google_meet',
+    identityKey: 'browser:google meet: online web and video conferencing calls',
+    windowId: 'edge-other-hwnd',
+    state: 'background',
+    foreground: false,
+    windowFocus: 'background',
+  };
+  const identifiedCall = {
+    pid: 35724,
+    provider: 'google_meet',
+    identityKey: 'meet:fai-wivv-szk',
+    windowId: 'edge-meet-hwnd',
+    state: 'active',
+    foreground: true,
+    windowFocus: 'foreground',
+  };
+
+  assert.deepEqual(findAmbiguousMeetingProcessIds([pageTitleFallback, identifiedCall]), [35724]);
+});
+
+test('expired unknown registry entries no longer block an otherwise unambiguous meeting', async () => {
+  const { findAmbiguousMeetingProcessIds } = await import('../capture-policy.mjs');
+  const current = {
+    pid: 36380, provider: 'google_meet', identityKey: 'meet:abc-defg-hij',
+    windowId: 'hwnd-a', state: 'active',
+  };
+  const expired = {
+    lifecycleKey: 'google_meet|meet:klm-nopq-rst',
+    provider: 'google_meet',
+    identityKey: 'meet:klm-nopq-rst',
+    windows: [{ pid: 36380, windowId: 'hwnd-b', state: 'unknown' }],
+  };
+  assert.deepEqual(findAmbiguousMeetingProcessIds([current, expired]), []);
+});
+
+test('duplicate windows for one durable meeting do not make process audio ambiguous', async () => {
+  const { findAmbiguousMeetingProcessIds } = await import('../capture-policy.mjs');
+  const sameMeeting = [
+    { pid: 36380, provider: 'google_meet', identityKey: 'meet:abc-defg-hij', windowId: 'hwnd-a', foreground: true, state: 'active', confidence: 'high' },
+    { pid: 36380, provider: 'google_meet', identityKey: 'meet:abc-defg-hij', windowId: 'hwnd-b', foreground: false, state: 'background', confidence: 'high' },
+  ];
+  assert.deepEqual(findAmbiguousMeetingProcessIds(sameMeeting), []);
+  assert.equal(selectStartCandidate(sameMeeting, null, 500, (row) => row.identityKey).candidate, sameMeeting[0]);
+});
+
+test('ambiguous meeting processes are isolated per PID', async () => {
+  const { findAmbiguousMeetingProcessIds } = await import('../capture-policy.mjs');
+  const rows = [
+    { pid: 1, provider: 'google_meet', identityKey: 'meet:abc-defg-hij', windowId: 'a', foreground: true, state: 'candidate' },
+    { pid: 1, provider: 'google_meet', identityKey: 'meet:klm-nopq-rst', windowId: 'b', foreground: false, state: 'background' },
+    { pid: 2, provider: 'zoom', identityKey: 'zoom:id:123456789', windowId: 'c', foreground: true, state: 'active' },
+  ];
+  assert.deepEqual(findAmbiguousMeetingProcessIds(rows), [1]);
+  assert.equal(selectStartCandidate(rows, null, 500, (row) => row.identityKey).candidate, rows[2]);
+});
+
+
+test('foreground meeting takes priority over verified-background Webex evidence', () => {
+  const webexBackground = {
+    pid: 18760,
+    provider: 'webex',
+    source: 'native_window',
+    identityKey: 'webex:window:18760:3675996',
+    windowId: '3675996',
+    state: 'active',
+    confidence: 'high',
+    foreground: false,
+    windowFocus: 'background',
+    evidence: [{ kind: 'webex_accessibility', value: 'end-meeting-control-present' }],
+  };
+  const foregroundMeet = {
+    pid: 36380,
+    provider: 'google_meet',
+    identityKey: 'meet:abc-defg-hij',
+    state: 'candidate',
+    confidence: 'medium',
+    foreground: true,
+  };
+  assert.equal(
+    selectStartCandidate([webexBackground, foregroundMeet], null, 500, (row) => row.identityKey).candidate,
+    foregroundMeet,
+  );
+});
+
+
+test('a temporarily missing registry window keeps its process ambiguous until terminal evidence or expiry', async () => {
+  const { findAmbiguousMeetingProcessIds } = await import('../capture-policy.mjs');
+  const current = {
+    pid: 36380, provider: 'google_meet', identityKey: 'meet:abc-defg-hij',
+    windowId: 'hwnd-a', state: 'active',
+  };
+  const retainedRegistryEntry = {
+    lifecycleKey: 'google_meet|meet:klm-nopq-rst',
+    provider: 'google_meet',
+    identityKey: 'meet:klm-nopq-rst',
+    windows: [{ pid: 36380, windowId: 'hwnd-b', state: 'temporarily_missing' }],
+  };
+  assert.deepEqual(findAmbiguousMeetingProcessIds([current, retainedRegistryEntry]), [36380]);
+
+  retainedRegistryEntry.windows[0].state = 'ended';
+  assert.deepEqual(findAmbiguousMeetingProcessIds([current, retainedRegistryEntry]), []);
+});
+
+test('initial candidate selection ignores retained registry windows after they become unknown', () => {
+  const currentObservation = {
+    pid: 36380, provider: 'google_meet', identityKey: 'meet:abc-defg-hij',
+    windowId: 'hwnd-a', foreground: true, state: 'candidate', confidence: 'high',
+  };
+  const retainedRegistryEntry = {
+    lifecycleKey: 'google_meet|meet:klm-nopq-rst',
+    provider: 'google_meet',
+    identityKey: 'meet:klm-nopq-rst',
+    windows: [{ pid: 36380, windowId: 'hwnd-b', state: 'unknown' }],
+  };
+  assert.equal(
+    selectStartCandidate([currentObservation], null, 500, (row) => row.identityKey, [retainedRegistryEntry]).candidate,
+    currentObservation,
+  );
 });

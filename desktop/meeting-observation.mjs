@@ -135,8 +135,13 @@ export function markActiveMeetingObservations(observations, currentCapture) {
     const sameIdentity = observation.identityKey === currentKey;
     const sameProcess = Number(observation.pid) === currentPid
       && normalizeProcessName(observation.processName) === currentProcess;
-    const googleMeetIdentityUpgrade = currentKey === 'browser:*'
+    const provisionalGoogleMeet = currentKey === 'browser:*'
+      || (currentCapture.provider === 'google_meet' && currentKey.startsWith('browser:'));
+    const sameGoogleMeetWindow = !currentCapture.windowId
+      || String(observation.windowId || '') === String(currentCapture.windowId);
+    const googleMeetIdentityUpgrade = provisionalGoogleMeet
       && sameProcess
+      && sameGoogleMeetWindow
       && observation.provider === 'google_meet'
       && observation.durableIdentity;
     const durableIdentityMovedProcess = observation.durableIdentity

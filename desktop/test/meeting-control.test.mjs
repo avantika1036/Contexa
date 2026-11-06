@@ -219,3 +219,217 @@ test('a new Webex call epoch is not suppressed by the previous call End Meeting 
     nextCall,
   );
 });
+
+test('same-provider meetings in different processes can hand off after the current meeting goes quiet', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 30_000, confirmations: 2 });
+  const current = {
+    provider: 'google_meet', processId: 1000, processName: 'chrome',
+    windowId: 'hwnd-chrome-a', sessionKey: 'meet:abc-defg-hij',
+  };
+  const rows = [
+    { provider: 'google_meet', pid: 1000, windowId: 'hwnd-chrome-a', identityKey: 'meet:abc-defg-hij', foreground: false, state: 'active', confidence: 'high' },
+    { provider: 'google_meet', pid: 2000, windowId: 'hwnd-edge-b', identityKey: 'meet:klm-nopq-rst', foreground: true, state: 'candidate', confidence: 'high' },
+  ];
+
+  assert.equal(tracker.observe(rows, current, { now: 45_000, lastMeetingAudioAt: 10_000, transitionType: 'same-window' }), null);
+  const result = tracker.observe(rows, current, { now: 47_500, lastMeetingAudioAt: 10_000, transitionType: 'same-window' });
+  assert.equal(result.identityKey, 'meet:klm-nopq-rst');
+  assert.equal(result.pid, 2000);
+});
+
+test('same-process meetings are never handed off while process-loopback audio is shared', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 30_000, confirmations: 1 });
+  const current = {
+    provider: 'google_meet', processId: 1000, processName: 'chrome',
+    windowId: 'hwnd-meet-a', sessionKey: 'meet:abc-defg-hij',
+  };
+  const candidate = {
+    provider: 'google_meet', pid: 1000, windowId: 'hwnd-meet-b',
+    identityKey: 'meet:klm-nopq-rst', foreground: true, state: 'candidate', confidence: 'high',
+  };
+  const rows = [
+    { provider: 'google_meet', pid: 1000, windowId: 'hwnd-meet-a', identityKey: 'meet:abc-defg-hij', foreground: false, state: 'active', confidence: 'high' },
+    candidate,
+  ];
+
+  assert.equal(
+    tracker.observe(rows, current, { now: 45_000, lastMeetingAudioAt: 10_000, transitionType: 'same-window' }),
+    null,
+  );
+});
+
+test('a foreground duplicate representation of the current durable meeting prevents handoff', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 30_000, confirmations: 1 });
+  const current = { provider: 'google_meet', processId: 1000, sessionKey: 'meet:abc-defg-hij' };
+  const rows = [
+    { provider: 'google_meet', pid: 1000, identityKey: 'meet:abc-defg-hij', foreground: false, state: 'background', confidence: 'high' },
+    { provider: 'google_meet', pid: 2000, identityKey: 'meet:abc-defg-hij', foreground: true, state: 'active', confidence: 'high' },
+    { provider: 'zoom', pid: 3000, identityKey: 'zoom:id:123456789', foreground: true, state: 'candidate', confidence: 'high' },
+  ];
+
+  assert.equal(tracker.observe(rows, current, { now: 45_000, lastMeetingAudioAt: 10_000, transitionType: 'missing' }), null);
+});
+
+test('handoff waits for a durable Google Meet code instead of switching to a page-title fallback', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 5_000, confirmations: 2 });
+  const current = {
+    provider: 'google_meet', processId: 1000, processName: 'chrome',
+    windowId: 'chrome-meet-hwnd', sessionKey: 'meet:abc-defg-hij',
+  };
+  const currentRow = {
+    provider: 'google_meet', pid: 1000, windowId: 'chrome-meet-hwnd',
+    identityKey: 'meet:abc-defg-hij', foreground: false, state: 'active', confidence: 'high',
+  };
+  const pageTitleFallback = {
+    provider: 'google_meet', pid: 2000, windowId: 'edge-meet-hwnd',
+    identityKey: 'browser:google meet: online web and video conferencing calls',
+    foreground: true, state: 'candidate', confidence: 'medium',
+  };
+
+  assert.equal(tracker.observe([currentRow, pageTitleFallback], current, {
+    now: 15_000, lastMeetingAudioAt: 10_000, transitionType: 'same-window',
+  }), null);
+  assert.equal(tracker.observe([currentRow, pageTitleFallback], current, {
+    now: 17_500, lastMeetingAudioAt: 10_000, transitionType: 'same-window',
+  }), null);
+
+  const confirmedDifferentCall = { ...pageTitleFallback, identityKey: 'meet:klm-nopq-rst' };
+  assert.equal(tracker.observe([currentRow, confirmedDifferentCall], current, {
+    now: 20_000, lastMeetingAudioAt: 10_000, transitionType: 'same-window',
+  }), null);
+  assert.equal(tracker.observe([currentRow, confirmedDifferentCall], current, {
+    now: 22_500, lastMeetingAudioAt: 10_000, transitionType: 'same-window',
+  }).identityKey, 'meet:klm-nopq-rst');
+});
+
+test('an ended or temporarily missing candidate breaks the confirmation chain', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 30_000, confirmations: 2 });
+  const current = { provider: 'google_meet', processId: 1000, sessionKey: 'meet:abc-defg-hij' };
+  const candidate = { provider: 'zoom', pid: 2000, identityKey: 'zoom:id:123456789', foreground: true, state: 'candidate', confidence: 'high' };
+  const options = { lastMeetingAudioAt: 10_000, transitionType: 'missing' };
+
+  assert.equal(tracker.observe([candidate], current, { ...options, now: 45_000 }), null);
+  assert.equal(tracker.observe([{ ...candidate, state: 'temporarily_missing' }], current, { ...options, now: 46_000 }), null);
+  assert.equal(tracker.observe([candidate], current, { ...options, now: 47_000 }), null);
+  assert.equal(tracker.observe([{ ...candidate, state: 'ended' }], current, { ...options, now: 48_000 }), null);
+  assert.equal(tracker.observe([candidate], current, { ...options, now: 49_000 }), null);
+  assert.equal(tracker.observe([candidate], current, { ...options, now: 51_000 }).identityKey, candidate.identityKey);
+});
+
+test('same-provider candidate title changes on one HWND retain handoff confirmation', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 30_000, confirmations: 2 });
+  const current = { provider: 'google_meet', processId: 1000, sessionKey: 'meet:abc-defg-hij' };
+  const first = [{ provider: 'zoom', pid: 2000, windowId: 'hwnd-zoom', identityKey: 'zoom:team sync', foreground: true, state: 'candidate', confidence: 'medium' }];
+  const second = [{ provider: 'zoom', pid: 2000, windowId: 'hwnd-zoom', identityKey: 'zoom:*', foreground: true, state: 'candidate', confidence: 'medium' }];
+
+  assert.equal(tracker.observe(first, current, { now: 45_000, lastMeetingAudioAt: 10_000, transitionType: 'missing' }), null);
+  assert.equal(tracker.observe(second, current, { now: 47_500, lastMeetingAudioAt: 10_000, transitionType: 'missing' }).identityKey, 'zoom:*');
+});
+
+
+test('a silent current meeting can hand off after the capture-start quiet interval', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 5_000, confirmations: 2 });
+  const current = {
+    provider: 'zoom', processId: 1000, processName: 'zoom',
+    windowId: 'hwnd-zoom-a', sessionKey: 'zoom:*', startedAt: 10_000,
+  };
+  const rows = [
+    { provider: 'zoom', pid: 1000, windowId: 'hwnd-zoom-a', identityKey: 'zoom:*', foreground: false, state: 'active', confidence: 'medium' },
+    { provider: 'google_meet', pid: 2000, windowId: 'hwnd-chrome-b', identityKey: 'meet:abc-defg-hij', foreground: true, state: 'candidate', confidence: 'high' },
+  ];
+
+  assert.equal(tracker.observe(rows, current, { now: 15_000, lastMeetingAudioAt: 0, transitionType: 'same-window' }), null);
+  const result = tracker.observe(rows, current, { now: 17_500, lastMeetingAudioAt: 0, transitionType: 'same-window' });
+  assert.equal(result.identityKey, 'meet:abc-defg-hij');
+});
+
+test('a silent meeting without a capture-start timestamp cannot hand off', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 5_000, confirmations: 1 });
+  const current = { provider: 'teams', processId: 1000, processName: 'teams', sessionKey: 'teams:*' };
+  const rows = [
+    { provider: 'teams', pid: 1000, identityKey: 'teams:*', foreground: false, state: 'active', confidence: 'medium' },
+    { provider: 'zoom', pid: 2000, identityKey: 'zoom:*', foreground: true, state: 'candidate', confidence: 'medium' },
+  ];
+  assert.equal(tracker.observe(rows, current, { now: 50_000, lastMeetingAudioAt: 0 }), null);
+});
+
+test('verified active background Webex can hand off consistently with initial selection', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 5_000, confirmations: 2 });
+  const current = {
+    provider: 'teams', processId: 1000, processName: 'teams',
+    windowId: 'hwnd-teams', sessionKey: 'teams:meeting-a', startedAt: 10_000,
+  };
+  const webex = {
+    provider: 'webex', source: 'native_window', pid: 2000,
+    identityKey: 'webex:window:2000:123456', windowId: '123456',
+    foreground: false, windowFocus: 'background', state: 'active', confidence: 'high',
+    evidence: [{ kind: 'webex_accessibility', value: 'end-meeting-control-present' }],
+  };
+  const rows = [
+    { provider: 'teams', pid: 1000, windowId: 'hwnd-teams', identityKey: 'teams:meeting-a', foreground: false, state: 'active', confidence: 'medium' },
+    webex,
+  ];
+  assert.equal(tracker.observe(rows, current, { now: 15_000, lastMeetingAudioAt: 0 }), null);
+  const result = tracker.observe(rows, current, { now: 17_500, lastMeetingAudioAt: 0 });
+  assert.equal(result.identityKey, webex.identityKey);
+});
+
+test('a real foreground candidate outranks verified-background Webex during handoff', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 5_000, confirmations: 1 });
+  const current = { provider: 'teams', processId: 1000, processName: 'teams', sessionKey: 'teams:meeting-a', startedAt: 10_000 };
+  const webex = {
+    provider: 'webex', source: 'native_window', pid: 2000,
+    identityKey: 'webex:window:2000:123456', windowId: '123456',
+    foreground: false, windowFocus: 'background', state: 'active', confidence: 'high',
+    evidence: [{ kind: 'webex_accessibility', value: 'end-meeting-control-present' }],
+  };
+  const foregroundMeet = {
+    provider: 'google_meet', pid: 3000, identityKey: 'meet:abc-defg-hij',
+    foreground: true, state: 'candidate', confidence: 'high',
+  };
+  const rows = [
+    { provider: 'teams', pid: 1000, identityKey: 'teams:meeting-a', foreground: false, state: 'active', confidence: 'medium' },
+    webex,
+    foregroundMeet,
+  ];
+  assert.equal(
+    tracker.observe(rows, current, { now: 15_000, lastMeetingAudioAt: 0 })?.identityKey,
+    foregroundMeet.identityKey,
+  );
+});
+
+
+test('a backgrounded captured Webex meeting can hand off to a real foreground meeting', async () => {
+  const { MeetingHandoffTracker } = await import('../meeting-control.mjs');
+  const tracker = new MeetingHandoffTracker({ quietMs: 5_000, confirmations: 2 });
+  const current = {
+    provider: 'webex', processId: 1000, processName: 'webex',
+    windowId: '123456', sessionKey: 'webex:window:1000:123456', startedAt: 10_000,
+  };
+  const currentWebex = {
+    provider: 'webex', source: 'native_window', pid: 1000,
+    identityKey: 'webex:window:1000:123456', windowId: '123456',
+    foreground: false, windowFocus: 'background', state: 'active', confidence: 'high',
+    evidence: [{ kind: 'webex_accessibility', value: 'end-meeting-control-present' }],
+  };
+  const nextMeeting = {
+    provider: 'google_meet', source: 'browser_window', pid: 2000,
+    identityKey: 'meet:abc-defg-hij', windowId: 'hwnd-chrome',
+    foreground: true, windowFocus: 'foreground', state: 'candidate', confidence: 'high',
+  };
+  const rows = [currentWebex, nextMeeting];
+
+  assert.equal(tracker.observe(rows, current, { now: 15_000, lastMeetingAudioAt: 0 }), null);
+  const result = tracker.observe(rows, current, { now: 17_500, lastMeetingAudioAt: 0 });
+  assert.equal(result.identityKey, nextMeeting.identityKey);
+});

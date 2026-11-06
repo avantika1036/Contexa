@@ -121,11 +121,21 @@ function updateWindowInventory(entry, observations, now, missingGraceMs, retenti
       entry.windows.set(windowKey, {
         ...window,
         state: 'temporarily_missing',
+        // Focus is a live OS observation, not durable meeting evidence. Once EnumWindows
+        // no longer returns this HWND, its previous foreground flag must not survive in
+        // registry snapshots or make a generic browser surface look foregrounded.
+        foreground: false,
+        windowFocus: 'unknown',
         missingSince: now,
       });
     } else if (window.state === 'temporarily_missing'
       && now - Number(window.missingSince || now) >= missingGraceMs) {
-      entry.windows.set(windowKey, { ...window, state: 'unknown' });
+      entry.windows.set(windowKey, {
+        ...window,
+        state: 'unknown',
+        foreground: false,
+        windowFocus: 'unknown',
+      });
     }
   }
 

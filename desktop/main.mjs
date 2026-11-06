@@ -14,8 +14,8 @@ import { meetingKey, meetingCaptureKey, classifyWindowTransition, SessionContinu
 import { createMeetingSession, resumeMeetingSession, suspendMeetingSession, upgradeMeetingIdentitySession } from './meeting-api.mjs';
 import { pumpReader } from './mic-reader.mjs';
 import { selectMicrophoneDevice, isRecoverableMicrophoneDeviceError, microphoneRetryDelayMs, waitForStableMicrophoneDevice } from './microphone-devices.mjs';
-import { captureStopReason, selectStartCandidate, resolveAutoCapture, normalizeDesktopWindows } from './capture-policy.mjs';
-import { planAutoCaptureEnd, addRestartBlock, reconcileRestartBlocks, CrossProviderHandoffTracker } from './meeting-control.mjs';
+import { captureStopReason, selectStartCandidate, resolveAutoCapture, normalizeDesktopWindows, findAmbiguousMeetingProcessIds, describeMeetingProcessIdentities } from './capture-policy.mjs';
+import { planAutoCaptureEnd, addRestartBlock, reconcileRestartBlocks, MeetingHandoffTracker } from './meeting-control.mjs';
 import { normalizeMeetingObservations, markActiveMeetingObservations } from './meeting-observation.mjs';
 import { MeetingLifecycleRegistry, lifecycleEventMatchesRestartBlock } from './meeting-lifecycle.mjs';
 import { WebexMeetingControlTracker } from './webex-meeting-controls.mjs';
@@ -49,7 +49,7 @@ const IDLE_RESTART_BLOCK_MS = Math.max(0, Number(process.env.CONTEXA_IDLE_RESTAR
 // Zoom/Teams/Webex windows closing normally means the call is over, so those end sooner.
 const NATIVE_SESSION_GRACE_MS = Math.max(0, Number(process.env.CONTEXA_NATIVE_SESSION_GRACE_SECONDS ?? 60)) * 1000;
 const CAPTURE_POLICY = { stopAfterMissingMs: STOP_AFTER_MISSING_MS, idleEndMs: IDLE_END_MS };
-const CROSS_PROVIDER_HANDOFF_QUIET_MS = Math.max(5, Number(process.env.CONTEXA_CROSS_PROVIDER_HANDOFF_QUIET_SECONDS || 30)) * 1000;
+const MEETING_HANDOFF_QUIET_MS = Math.max(5, Number(process.env.CONTEXA_MEETING_HANDOFF_QUIET_SECONDS || process.env.CONTEXA_CROSS_PROVIDER_HANDOFF_QUIET_SECONDS || 30)) * 1000;
 const SESSION_GRACE_MS = Math.max(0, Number(process.env.CONTEXA_SESSION_GRACE_SECONDS || 300)) * 1000;
 const PCM_RATE = 48000;
 const OUTPUT_FRAME_MS = 100;
@@ -76,7 +76,7 @@ let migrationsApplied = false;
 const continuity = new SessionContinuity({ graceMs: SESSION_GRACE_MS });
 // Tracks observations for every detected meeting, even while one audio stream is active.
 const lifecycleRegistry = new MeetingLifecycleRegistry({ missingGraceMs: 30_000, retentionMs: 15 * 60_000 });
-const crossProviderHandoff = new CrossProviderHandoffTracker({ quietMs: CROSS_PROVIDER_HANDOFF_QUIET_MS, confirmations: 2, candidateWindowMs: 15_000 });
+const meetingHandoffTracker = new MeetingHandoffTracker({ quietMs: MEETING_HANDOFF_QUIET_MS, confirmations: 2, candidateWindowMs: 15_000 });
 const WEBEX_WINDOW_ABSENCE_GRACE_MS = Math.max(10, Number(process.env.CONTEXA_WEBEX_WINDOW_ABSENCE_SECONDS || 20)) * 1000;
 const webexMeetingControlTracker = new WebexMeetingControlTracker({ missedPollsToEnd: 2, windowAbsenceGraceMs: WEBEX_WINDOW_ABSENCE_GRACE_MS });
 const webexUiaCacheByPid = new Map();
@@ -1254,6 +1254,28 @@ async function monitorMeetingWindows() {
       lastMeetingWindowSnapshot = windowSnapshot;
       console.info(`[Meeting detector] supported meeting windows: ${windowSnapshot || '(none)'}`);
     }
+    // Process-loopback audio cannot distinguish two separate meetings owned by one PID.
+    // Fail closed instead of attaching mixed audio to whichever meeting won arbitration.
+    const registrySnapshot = lifecycle.snapshot || [];
+    const ambiguousMeetingPids = findAmbiguousMeetingProcessIds([...matches, ...registrySnapshot]);
+    if (currentCapture && ambiguousMeetingPids.includes(Number(currentCapture.processId))) {
+      meetingHandoffTracker.reset();
+      const competingIdentities = describeMeetingProcessIdentities([...matches, ...registrySnapshot], currentCapture.processId);
+      const missingWindows = registrySnapshot.flatMap((entry) =>
+        (entry.windows || []).filter((window) => Number(window.pid) === Number(currentCapture.processId)
+          && window.state === 'temporarily_missing')
+      );
+      const remainingGraceMs = Math.max(0, ...missingWindows.map((window) =>
+        lifecycleRegistry.missingGraceMs - Math.max(0, Date.now() - Number(window.missingSince || Date.now()))
+      ));
+      const recoveryNote = remainingGraceMs > 0
+        ? ` A competing window is temporarily missing; Contexa will keep capture paused for up to ${Math.ceil(remainingGraceMs / 1000)}s unless it returns or terminal evidence arrives.`
+        : '';
+      console.warn(`[Meeting arbitration] pausing capture for PID ${currentCapture.processId}: multiple independent meetings share this process, and process-loopback audio cannot isolate them. Competing observations: ${competingIdentities.join(' | ') || 'identity details unavailable'}.${recoveryNote} Meeting-tab/native isolated capture is required before simultaneous meetings can be captured independently.`);
+      await stopCapture('Multiple independent meetings share this process; process-level audio cannot isolate them safely', { suspendOnly: true });
+      return;
+    }
+
     // Do not jump to another browser/meeting window merely because the current title
     // briefly changed. Wait for the active target to be absent for the grace period.
     if (currentCapture) {
@@ -1269,12 +1291,12 @@ async function monitorMeetingWindows() {
           until: now + IDLE_RESTART_BLOCK_MS,
         });
         console.info(`Provider window explicitly reports ${transition.window.state}; finalizing capture for ${currentCapture.meetingId}.`);
-        crossProviderHandoff.reset();
+        meetingHandoffTracker.reset();
         await stopCapture(`Provider reported meeting ${transition.window.state}`, { endNow: true });
         return;
       }
 
-      const handoffCandidate = crossProviderHandoff.observe(matches, currentCapture, {
+      const handoffCandidate = meetingHandoffTracker.observe(matches, currentCapture, {
         now,
         transitionType: transition.type,
         lastMeetingAudioAt: currentCapture.audioStats?.lastMeetingAudioAt || 0,
@@ -1282,15 +1304,11 @@ async function monitorMeetingWindows() {
       });
       if (handoffCandidate) {
         const previousCapture = currentCapture;
-        restartBlocks = addRestartBlock(restartBlocks, {
-          pid: previousCapture.processId,
-          provider: previousCapture.provider,
-          key: previousCapture.sessionKey,
-          windowId: previousCapture.windowId,
-          until: now + IDLE_RESTART_BLOCK_MS,
-        });
-        console.info(`[Meeting arbitration] confirmed foreground ${handoffCandidate.provider} meeting (PID ${handoffCandidate.pid}) after ${Math.round(CROSS_PROVIDER_HANDOFF_QUIET_MS / 1000)}s without meeting-side audio from ${previousCapture.provider}; handing off the single capture stream.`);
-        await stopCapture(`A different foreground meeting was detected: ${handoffCandidate.title || handoffCandidate.displayTitle || handoffCandidate.provider}`, { endNow: true });
+        console.info(`[Meeting arbitration] confirmed foreground ${handoffCandidate.provider} meeting (PID ${handoffCandidate.pid}, identity ${handoffCandidate.identityKey}) after ${Math.round(MEETING_HANDOFF_QUIET_MS / 1000)}s without meeting-side audio from ${previousCapture.provider}; handing off the single capture stream.`);
+        // A foreground switch is not evidence that the previous meeting ended. Suspend
+        // its session without adding an End Meeting restart block; a later foreground
+        // return may reclaim the same persisted session through its capture identity.
+        await stopCapture(`A different foreground meeting was selected: ${handoffCandidate.title || handoffCandidate.displayTitle || handoffCandidate.provider}`, { suspendOnly: true });
         await startCaptureForWindow(handoffCandidate);
         return;
       }
@@ -1383,8 +1401,8 @@ async function monitorMeetingWindows() {
       return;
     }
 
-    crossProviderHandoff.reset();
-    const selection = selectStartCandidate(matches, restartBlocks, Date.now(), (windowInfo) => windowInfo.identityKey || meetingKey(windowInfo.processName, windowInfo.title));
+    meetingHandoffTracker.reset();
+    const selection = selectStartCandidate(matches, restartBlocks, Date.now(), (windowInfo) => windowInfo.identityKey || meetingKey(windowInfo.processName, windowInfo.title), registrySnapshot);
     restartBlocks = selection.blocks || selection.block || [];
     const match = selection.candidate;
     if (match) {

@@ -176,8 +176,20 @@ export function classifyWindowTransition(matches, current) {
     return foreground.length === 1 ? foreground[0] : null;
   };
 
-  if (current.sessionKey === 'browser:*' && familyOf(current.processName) === 'browser') {
+  const currentGoogleMeetKey = String(current.sessionKey || '');
+  const provisionalGoogleMeet = familyOf(current.processName) === 'browser'
+    && (currentGoogleMeetKey === 'browser:*'
+      || (String(current.provider || '').toLowerCase() === 'google_meet'
+        && currentGoogleMeetKey.startsWith('browser:')));
+
+  if (provisionalGoogleMeet) {
+    // A browser may initially expose a descriptive Google Meet page title rather than
+    // `browser:*`. Once that SAME top-level HWND exposes its call code, treat it as an
+    // identity upgrade. Never borrow a call ID from another HWND in the same process:
+    // that may be a genuinely separate meeting window.
     const identifiedMeets = matches.filter((windowInfo) => sameProcess(windowInfo)
+      && String(windowInfo.provider || 'google_meet').toLowerCase() === 'google_meet'
+      && (!current.windowId || String(windowInfo.windowId || '') === String(current.windowId))
       && /^meet:[a-z]{3}-[a-z]{4}-[a-z]{3}$/i.test(keyOf(windowInfo)));
     const identifiedMeet = chooseUnambiguousWindow(identifiedMeets);
     if (identifiedMeet) {
